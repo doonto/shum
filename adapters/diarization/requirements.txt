@@ -1,0 +1,7 @@
+# Dependency manifest for the isolated pyannote Community-1 diarization adapter.
+# Install with: pip install -r requirements.txt
+#
+# pyannote.audio>=4.0 is required for the Community-1 pipeline (exclusive
+# speaker diarization, bundled offline checkpoints). It requires Python 3.10+.
+pyannote.audio>=4.0,<5
+torch>=2.1,<3

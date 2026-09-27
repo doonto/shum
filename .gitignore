@@ -1,0 +1,14 @@
+/target
+/jobs/
+/models/
+/.venv/
+**/.venv/
+**/.venv*/
+**/__pycache__/
+**/.pytest_cache/
+*.pyc
+*.mp3
+*.wav
+*.nemo
+*.safetensors
+/shum.toml

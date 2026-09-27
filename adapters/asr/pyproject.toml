@@ -1,0 +1,48 @@
+[project]
+name = "shum-asr-adapters"
+version = "0.1.0"
+description = "Isolated Python ASR engine adapters (NeMo, Whisper/Transformers, Qwen3-ASR) for the shum CLI contract."
+readme = "README.md"
+requires-python = ">=3.10"
+# main.py only needs the standard library; heavy per-engine dependencies are
+# declared as optional-dependency groups below and installed into their own
+# isolated environments (see README.md).
+dependencies = []
+
+[project.optional-dependencies]
+nemo = [
+    "torch>=2.2",
+    "nemo_toolkit[asr]>=2.0.0",
+]
+whisper = [
+    "torch>=2.2",
+    "transformers>=4.57.6",
+    "accelerate>=0.30.0",
+]
+qwen = [
+    "torch>=2.2",
+    "transformers>=4.57.6",
+    "accelerate>=0.30.0",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+# This is a flat, unpackaged project: `main.py` is run directly with
+# `python main.py ...` and is never imported as an installed library, so
+# there is no [build-system] and uv must not try to build/install it.
+[tool.uv]
+package = false
+
+# Force CPU-only PyTorch wheels on every platform (contract requires
+# PyTorch CPU, never a CUDA build), across all three engine environments.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

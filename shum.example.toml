@@ -1,0 +1,55 @@
+# Copy to shum.toml and set the interpreter paths after installing the adapters.
+# An empty revision means the model has not yet been installed.
+# Optional: review_rules = "rules.txt" (domain vocabulary/style for the LLM;
+# cannot override the rule against inventing words).
+
+[[models]]
+role = "primeline"
+repo = "primeline/parakeet-primeline"
+revision = ""
+path = "models/primeline"
+
+[[models]]
+role = "flix"
+repo = "Flix-AI/flix-swissgerman-full"
+revision = ""
+path = "models/flix"
+
+[[models]]
+role = "qwen"
+repo = "Qwen/Qwen3-ASR-1.7B-hf"
+revision = ""
+path = "models/qwen"
+
+[[models]]
+role = "diarization"
+repo = "pyannote/speaker-diarization-community-1"
+revision = ""
+path = "models/diarization"
+
+[asr.primeline]
+program = "adapters/asr/.venv-nemo/bin/python"
+script = "adapters/asr/main.py"
+threads = 6
+
+[asr.flix]
+program = "adapters/asr/.venv-whisper/bin/python"
+script = "adapters/asr/main.py"
+threads = 6
+
+[asr.qwen]
+program = "adapters/asr/.venv-qwen/bin/python"
+script = "adapters/asr/main.py"
+threads = 6
+
+[diarization]
+program = "adapters/diarization/.venv/bin/python"
+script = "adapters/diarization/main.py"
+threads = 4
+
+# Codex reads a prompt from stdin and writes the last response to {output}.
+# Replace with another CLI and arguments if desired; its response must match
+# the structured JSON contract described in README.md.
+[llm]
+program = "codex"
+args = ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{output}", "-"]
