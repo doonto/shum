@@ -22,8 +22,8 @@
 //!   the same pinned sha and silently do nothing.
 //! - [`install_pinned`] downloads and validates the *exact* `spec.revision`
 //!   already recorded on the spec (no network lookup for "latest"), for
-//!   callers that need reproducible installs of a known revision. It is not
-//!   currently wired into the CLI, which only exposes `update`.
+//!   callers that need reproducible installs of a known revision. The CLI
+//!   exposes this as `models install-pinned --role <role>`.
 //!
 //! Both [`update`] and [`install_pinned`] materialize a revision into its
 //! own immutable, never-reused directory `<base>/<revision>` (see
@@ -37,7 +37,7 @@
 //! path for a later `check` to mistake as valid. The returned spec's `path`
 //! points at the new directory; *activating* it — making it what future
 //! runs use — is entirely up to the caller, typically by persisting the
-//! returned spec into `shum.toml`.
+//! returned spec into the per-user Shum config.
 //!
 //! # Local manifest
 //!
@@ -269,7 +269,7 @@ fn base_dir_for(spec: &ModelSpec) -> &Path {
 /// `<base>/<revision>` directory (see [`base_dir_for`]); `spec.path` (the
 /// previously active directory, if different) is never read, modified, or
 /// removed by this function. Making the returned spec "active" — e.g. by
-/// persisting it into `shum.toml` — is the caller's responsibility;
+/// persisting it into the per-user config — is the caller's responsibility;
 /// `update` only produces a validated, ready directory.
 ///
 /// If Hugging Face cannot be reached, the download fails, or integrity
@@ -318,21 +318,19 @@ where
 /// Download and validate the *exact* `spec.revision` already recorded on the
 /// spec into its own immutable directory, without consulting Hugging Face
 /// for a "latest" revision. Useful for reproducible installs of a known
-/// revision; not wired into the CLI, which only exposes [`update`].
+/// revision; exposed as `models install-pinned --role <role>`.
 ///
 /// # Errors
 ///
 /// Fails if `spec.revision` is empty (nothing to pin to — use [`update`] to
 /// bootstrap), if the `hf` CLI is not installed/on `PATH`, if the download
 /// command exits non-zero, or if the manifest cannot be written afterward.
-#[allow(dead_code)] // Intentionally-provided API not yet wired into the CLI (which only exposes `update`).
 pub fn install_pinned(spec: &ModelSpec) -> anyhow::Result<ModelSpec> {
     install_pinned_with(spec, run_hf_download)
 }
 
 /// Core of [`install_pinned`], with the download step injected as a closure
 /// so it is unit-testable without the real `hf` CLI.
-#[allow(dead_code)] // Only reachable through `install_pinned`, see above.
 fn install_pinned_with<Download>(spec: &ModelSpec, download: Download) -> anyhow::Result<ModelSpec>
 where
     Download: FnOnce(&str, &str, &Path) -> anyhow::Result<()>,

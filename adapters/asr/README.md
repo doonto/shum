@@ -70,6 +70,141 @@ python main.py --engine {nemo,whisper,qwen}     --model /absolute/local/model/pa
 Single-clip mode (`--input`/`--output`, no `--serve`) is unchanged and
 still supported for one-off transcriptions.
 
+## Experimental shared-server Qwen3-ASR GGUF worker
+
+`qwen_gguf_worker.py` is an **alternative** to the Transformers Qwen
+worker. It launches one offline CPU-only `llama-server` on a private Unix
+socket, sends 16 kHz WAV data over that socket, and serves up to four
+indexed requests concurrently. The temporary socket directory is private
+(mode 0700); the server is supervised with a Linux parent-death signal
+and stopped when the worker exits. No audio URL or public HTTP port is
+used. The Python worker has no additional package dependencies.
+
+This profile is **not enabled by default**. Set the Qwen model spec to
+`repo = "Qwen/Qwen3-ASR-1.7B"` with
+`revision = "7278e1e70fe206f11671096ffdd38061171dd6e5"` and a
+separate, initially empty model base path **outside the source tree**
+(for example `/absolute/shum-data/models/qwen-original`), then run
+`shum models install-pinned --role qwen` with that config. Do not
+identify a GGUF converted from this **original** checkpoint as the
+existing `Qwen/Qwen3-ASR-1.7B-hf` revision: they are distinct repos
+and model layouts. The model manager verifies the original snapshot;
+the worker hashes the server binary and both derived GGUF files on
+every startup. The original model is never rewritten.
+
+Set `[asr.qwen]` to a Python 3.11+ interpreter and
+`script = "adapters/asr/qwen_gguf_worker.py"`, `threads = 16`,
+`max_in_flight = 4`. The adapter `args` must supply absolute paths and
+their lowercase SHA-256 hex strings:
+
+| Flag | Artifact / value |
+| --- | --- |
+| `--server`, `--server-sha256` | Pinned CPU-built `llama-server` executable and its local SHA-256 |
+| `--gguf`, `--gguf-sha256` | Q8_0 text GGUF derived from the pinned **original** Qwen checkpoint; the measured file's hash is `160537d1960d8367b38a3720aeaab8bc670fc5eb7b22fd58f0f94773af5e2832` |
+| `--mmproj`, `--mmproj-sha256` | Matching Q8_0 audio projector; the measured file's hash is `8adf1c469db468b96d1cdbd4a90ce15fa8d98b8a0560d868d984ba4927926f87` |
+| `--slots` | `4` (or fewer, matching `max_in_flight`) |
+| `--language` | Optional `German` or `Russian` decoder prefix; omit only when automatic language detection is acceptable |
+
+The measured `llama.cpp` source commit was
+`4da6337767f973e2b4d0797e5b323d77d8565e4a`; compute the server
+binary hash **after** building it (`sha256sum /absolute/llama-server`),
+since compilation changes the binary. Remove `qwen` from
+`resources.offload_roles`: GGUF is already quantized and does not support
+Transformers disk offload. Set `resources.estimated_peak_mib.qwen` to a
+peak actually measured for the shared server **plus** worker on your
+machine, rather than the Transformers estimate. The model and artifact
+hashes, paths, language setting and in-flight limit become part of the
+job manifest; changing them requires a new output directory.
+
+A separate 30-minute CPU experiment (four slots, 16 threads, forced
+German) finished 67 windows in 401.2 seconds including server startup,
+without a length-truncated or repeating answer. This is **not** the
+formal Rust benchmark, and speed alone does not establish accuracy:
+some windows without diarized speech still yielded text, including one
+117-character hallucination candidate. Autodetection also selected
+several wrong languages and hit a generation limit. Validate difficult
+clips against the audio before relying on this alternative. Set an
+appropriate language for recordings containing Russian rather than
+forcing German on their Russian speech.
+
+## Other locally tested CPU engines (not integrated adapters)
+
+The [Swiss German Turbo Whisper CT2 weights](https://huggingface.co/gcoli/whisper-large-v3-turbo-swiss-german-mit)
+at revision `540fb2e7a9135048963c5de9822579c96f8962e5` were loaded
+directly with `faster-whisper`/CTranslate2 int8. On the same 67 windows,
+three processes with six threads each, German transcription, VAD and
+beam 3 with **default decoding fallback** took 282.9 seconds. No window
+exceeded a 0.5 repeated-four-gram fraction. Disabling fallback and
+reducing to beam 2 took 269.1 seconds but caused severe repetition in
+three windows. This is a *different* source checkpoint: do not pass its
+CT2 directory to `flix_fast_worker.py` with the Flix model manifest.
+That adapter intentionally rejects mismatched provenance. A separate
+pinned model definition and a quality-checked adapter would be needed
+before using Turbo in a normal job.
+
+[NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+Q8_0 GGUF at revision `541d1f99c6b0c3cd0b11a95167540bb8edefd82b`
+ran locally in the official NeMo-Speech.cpp v0.1.0 **CPU** CLI:
+
+```bash
+nemo-speech transcribe /private/67-clips \
+  --model /absolute/path/to/parakeet-tdt-0.6b-v3.q8_0.gguf \
+  --device cpu --format json --concurrency 1 \
+  --output-dir /private/parakeet-results
+```
+
+One model load plus all 67 clips took 213.2 seconds, with 67 JSON
+responses, about four CPU cores active and no large four-gram repeats.
+The output JSON has words with timestamps but does **not** implement
+shum's persistent JSON-lines worker protocol or its model-revision
+checks. It cannot replace `[asr.primeline]` by changing only `script`.
+Some windows disagree sharply with the existing primeLine output;
+without an audio-grounded transcript these comparisons do not
+establish WER or suitability for Swiss German. See the
+[method and all engine results](../../README.md#cpu-engine-comparison-on-one-recording).
+
+## Optional CPU/disk offload (`--offload-dir`)
+
+Whisper and Qwen3-ASR can opt in to Accelerate CPU/disk offload. The default
+load path is unchanged; NeMo does not support this flag. Explicitly provide
+an **absolute, private** cache root outside the original model snapshot:
+
+```bash
+mkdir -m 700 -p /absolute/private/asr-offload
+.venv-whisper/bin/python main.py --engine whisper \
+    --model /absolute/models/flix/<pinned-revision> --threads 4 \
+    --offload-dir /absolute/private/asr-offload --serve
+```
+
+The same flag works for `--engine qwen` and in single-clip mode. Shum's
+Rust scheduler enables it only when `resources.offload_dir` is configured
+and its memory policy selects an offloaded worker. The adapter creates a private mode-0700
+directory per engine and model revision/path under that root and refuses
+symlinks, non-private cache directories, and cache roots inside the source
+model snapshot. It never writes into the original checkpoint. Hugging Face
+loading remains `local_files_only=True` with the offline environment flags
+below. The 2 GiB Accelerate **model placement** budget on CPU is not a
+process RSS limit; processors, activations, and temporary weights also use
+RAM. Accelerate may read disk-mapped safetensors directly, leaving the cache
+directory empty even when `hf_device_map` contains disk-offloaded modules.
+Provide enough free disk space for other checkpoint formats.
+
+This mode was checked offline on the pinned original Flix Whisper
+(`a9c347a904af5d31b28c537ac732e0618aed6136`) and Qwen3-ASR
+(`bcd2b5b7f32b480ab5790554cfa8347f246a14f3`) with Accelerate 1.15,
+Transformers 5.17, and CPU PyTorch 2.14. Both generated *exactly* the same
+text, language and segments as their existing baseline on the same private
+28-second pilot clip; no clip/transcript is included here. With 4 threads:
+
+| Engine | Default peak RSS / total elapsed | Offload peak RSS / total elapsed |
+| --- | --- | --- |
+| Flix Whisper | ~9.0 GiB / 111 s | ~5.0 GiB / 205 s |
+| Qwen3-ASR | ~11.9 GiB / 50 s | ~5.2 GiB / 245 s |
+
+These are single-process peak RSS and wall-clock measurements, not memory
+guarantees or parallel-worker benchmarks. Disk offload substantially reduces
+resident memory but slows every clip, especially Qwen3-ASR.
+
 ## Output format
 
 ```json
@@ -95,15 +230,16 @@ still supported for one-off transcriptions.
 
 * **Offline**: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`,
   `HF_DATASETS_OFFLINE=1` and `HF_HUB_DISABLE_TELEMETRY=1` are set before any
-  network-capable library is imported, and every `from_pretrained`/`restore_from`
-  call also passes `local_files_only=True` explicitly as an independent
-  second guard. There is no code path that reaches the network to check for
-  or download model updates.
+  network-capable library is imported. Hugging Face model and processor
+  loading also passes `local_files_only=True` explicitly; NeMo restores
+  the given local `.nemo` checkpoint. There is no code path that reaches
+  the network to check for or download model updates.
 * **CPU-only, PyTorch CPU builds**: `pyproject.toml` pins `torch` to the
   `https://download.pytorch.org/whl/cpu` index for every engine (see
   *Install* below), and each engine explicitly loads its model on
-  `"cpu"`/`torch.device("cpu")` and pins the intra-op thread count from
-  `--threads` via `torch.set_num_threads`, plus the standard
+  `"cpu"`/`torch.device("cpu")` by default; in offload mode, Accelerate
+  dispatches layers between CPU and local disk (never GPU). Both modes pin
+  the intra-op thread count from `--threads` via `torch.set_num_threads`, plus the standard
   `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` /
   `NUMEXPR_NUM_THREADS` environment variables.
 * **No silent fallback**: input that isn't 16 kHz mono WAV, a `--model` path
@@ -201,8 +337,9 @@ of time with whatever tooling you prefer (`huggingface-cli download`,
   falls back to a single segment spanning the whole file instead of
   guessing sub-segment timing. NeMo checkpoints are monolingual, so
   `language` is always `null`.
-* **whisper**: loads the checkpoint with the `automatic-speech-recognition`
-  `pipeline(..., device="cpu", dtype=torch.float32, local_files_only=True)`
+* **whisper**: loads the local checkpoint and processor, then uses the
+  `automatic-speech-recognition` pipeline (with `device="cpu"` by default;
+  Accelerate controls placement in offload mode)
   and calls it with `chunk_length_s=30, return_timestamps=True,
   return_language=True`, which yields chunk-level segments plus a per-chunk
   detected/forced language (Whisper is the only architecture the pipeline

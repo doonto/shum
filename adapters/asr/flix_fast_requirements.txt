@@ -1,0 +1,20 @@
+# Isolated-environment dependencies for the flix_fast_* prototype
+# (CTranslate2 conversion + faster-whisper CPU inference for the original
+# pinned Flix SwissGerman Whisper checkpoint). Kept out of pyproject.toml
+# intentionally: this is a standalone, not-yet-adopted prototype, and the
+# per-engine venv pattern here mirrors the existing .venv-whisper/.venv-qwen/
+# .venv-nemo isolation (see README.md and flix_fast_README.md).
+#
+# Setup (CPU-only torch, matching the rest of this project):
+#   uv venv --python 3.11 .venv-flix-fast
+#   uv pip install --python .venv-flix-fast/bin/python \
+#       -r flix_fast_requirements.txt \
+#       --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# torch/transformers are only required for flix_fast_convert.py (loading the
+# original HF checkpoint to convert it); flix_fast_worker.py itself only
+# needs ctranslate2 + faster-whisper at runtime.
+ctranslate2>=4.0,<5
+faster-whisper==1.2.1
+torch>=2.2
+transformers>=4.57.6

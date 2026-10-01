@@ -74,8 +74,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
+import re
+import stat
 import sys
 import tempfile
 import wave
@@ -142,6 +145,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         help="Number of CPU threads to use for inference.",
+    )
+    parser.add_argument(
+        "--offload-dir",
+        default=None,
+        help=(
+            "Opt in to Accelerate CPU/disk offload for whisper/qwen with a "
+            "2 GiB model CPU budget. Absolute private cache root outside "
+            "the model snapshot; each engine/revision gets its own directory."
+        ),
     )
     parser.add_argument(
         "--serve",
@@ -226,6 +238,32 @@ def validate_model_path(engine: str, model_path: str) -> Path:
                 f"local Transformers checkpoint): {path}"
             )
     return path
+
+
+def validate_offload_dir(engine: str, model_dir: Path, offload_dir: str | None) -> Path | None:
+    if offload_dir is None:
+        return None
+    if engine == "nemo":
+        raise AdapterError("--offload-dir is supported only for whisper and qwen")
+    root = Path(offload_dir)
+    if not root.is_absolute():
+        raise AdapterError(f"--offload-dir must be an absolute path, got: {offload_dir!r}")
+    if root.is_symlink() or root.resolve().is_relative_to(model_dir.resolve()):
+        raise AdapterError("--offload-dir must not be a symlink or inside the model snapshot")
+    revision = model_dir.name if re.fullmatch(r"[0-9a-fA-F]{40}", model_dir.name) else "local"
+    identity = hashlib.sha256(os.fsencode(model_dir.resolve())).hexdigest()[:12]
+    engine_dir = root / engine
+    cache = engine_dir / f"{revision}-{identity}"
+    for directory in (root, engine_dir, cache):
+        if directory.is_symlink():
+            raise AdapterError(f"--offload-dir cache must not contain symlinks: {directory}")
+        try:
+            directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        except OSError as exc:
+            raise AdapterError(f"Cannot create --offload-dir cache {directory}: {exc}") from exc
+        if not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) & 0o077:
+            raise AdapterError(f"--offload-dir cache must be a private directory (mode 0700): {directory}")
+    return cache
 
 
 def validate_input_wav(input_path: str) -> tuple[Path, float]:
@@ -422,13 +460,15 @@ def nemo_transcribe(model: Any, input_path: str, duration: float) -> dict[str, A
 # Whisper (Transformers) engine
 # ---------------------------------------------------------------------------
 
-WhisperPipelineFactory = Callable[[str, int], Any]
+WhisperPipelineFactory = Callable[..., Any]
 
 
-def default_whisper_pipeline_factory(model_dir: str, threads: int) -> Any:
+def default_whisper_pipeline_factory(
+    model_dir: str, threads: int, *, offload_folder: str | None = None
+) -> Any:
     try:
         import torch
-        from transformers import pipeline
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
     except ImportError as exc:
         raise AdapterError(
             "Missing dependency for --engine whisper: install the "
@@ -440,13 +480,25 @@ def default_whisper_pipeline_factory(model_dir: str, threads: int) -> Any:
     torch.set_num_threads(threads)
 
     try:
-        asr_pipeline = pipeline(
-            task="automatic-speech-recognition",
-            model=model_dir,
-            device="cpu",
-            dtype=torch.float32,
-            local_files_only=True,
-        )
+        processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
+        load_options: dict[str, Any] = {"dtype": torch.float32, "local_files_only": True}
+        if offload_folder is not None:
+            load_options.update(
+                device_map="auto",
+                max_memory={"cpu": "2GiB"},
+                offload_folder=offload_folder,
+                offload_state_dict=True,
+            )
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_dir, **load_options)
+        pipeline_options: dict[str, Any] = {
+            "task": "automatic-speech-recognition",
+            "model": model,
+            "tokenizer": processor.tokenizer,
+            "feature_extractor": processor.feature_extractor,
+        }
+        if offload_folder is None:
+            pipeline_options["device"] = "cpu"
+        asr_pipeline = pipeline(**pipeline_options)
     except Exception as exc:
         raise AdapterError(
             f"Failed to load the Whisper Transformers checkpoint from "
@@ -503,10 +555,12 @@ def whisper_transcribe(asr_pipeline: Any, input_path: str, duration: float) -> d
 # Qwen3-ASR (Transformers) engine
 # ---------------------------------------------------------------------------
 
-QwenModelFactory = Callable[[str, int], tuple[Any, Any]]
+QwenModelFactory = Callable[..., tuple[Any, Any]]
 
 
-def default_qwen_model_factory(model_dir: str, threads: int) -> tuple[Any, Any]:
+def default_qwen_model_factory(
+    model_dir: str, threads: int, *, offload_folder: str | None = None
+) -> tuple[Any, Any]:
     try:
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -522,16 +576,23 @@ def default_qwen_model_factory(model_dir: str, threads: int) -> tuple[Any, Any]:
 
     try:
         processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
-        model = AutoModelForMultimodalLM.from_pretrained(
-            model_dir, dtype=torch.float32, local_files_only=True
-        )
+        load_options: dict[str, Any] = {"dtype": torch.float32, "local_files_only": True}
+        if offload_folder is not None:
+            load_options.update(
+                device_map="auto",
+                max_memory={"cpu": "2GiB"},
+                offload_folder=offload_folder,
+                offload_state_dict=True,
+            )
+        model = AutoModelForMultimodalLM.from_pretrained(model_dir, **load_options)
     except Exception as exc:
         raise AdapterError(
             f"Failed to load the Qwen3-ASR checkpoint from {model_dir!r} "
             f"(original error: {exc})"
         ) from exc
 
-    model.to("cpu")
+    if offload_folder is None:
+        model.to("cpu")
     model.eval()
     return model, processor
 
@@ -557,10 +618,24 @@ def qwen_transcribe(model: Any, processor: Any, input_path: str, duration: float
             f"Failed to prepare Qwen3-ASR inputs for {input_path!r}: {exc}"
         ) from exc
 
+    generation_config = model.generation_config
+    max_tokens = generation_config.max_new_tokens
+    if not isinstance(max_tokens, int) or max_tokens < 1:
+        raise AdapterError("Qwen3-ASR generation_config.max_new_tokens must be a positive integer")
     try:
-        output_ids = model.generate(**inputs, max_new_tokens=4096)
+        output_ids = model.generate(**inputs, max_new_tokens=max_tokens)
     except Exception as exc:
         raise AdapterError(f"Qwen3-ASR generation failed for {input_path!r}: {exc}") from exc
+
+    generated_count = output_ids.shape[1] - inputs["input_ids"].shape[1]
+    if generated_count >= max_tokens:
+        eos_ids = generation_config.eos_token_id
+        eos_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
+        if not eos_ids or output_ids[0, -1].item() not in eos_ids:
+            raise AdapterError(
+                f"Qwen3-ASR hit the {max_tokens}-token generation limit without EOS for "
+                f"{input_path!r}; the response may be incomplete"
+            )
 
     generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
     try:
@@ -591,6 +666,7 @@ def build_transcribe_fn(
     model_path: Path,
     threads: int,
     *,
+    offload_folder: Path | None = None,
     nemo_model_factory: NemoModelFactory | None = None,
     whisper_pipeline_factory: WhisperPipelineFactory | None = None,
     qwen_model_factory: QwenModelFactory | None = None,
@@ -610,11 +686,17 @@ def build_transcribe_fn(
         return lambda input_path, duration: nemo_transcribe(model, input_path, duration)
     elif engine == "whisper":
         factory = whisper_pipeline_factory or default_whisper_pipeline_factory
-        asr_pipeline = factory(str(model_path), threads)
+        asr_pipeline = (
+            factory(str(model_path), threads, offload_folder=str(offload_folder))
+            if offload_folder is not None else factory(str(model_path), threads)
+        )
         return lambda input_path, duration: whisper_transcribe(asr_pipeline, input_path, duration)
     elif engine == "qwen":
         factory = qwen_model_factory or default_qwen_model_factory
-        model, processor = factory(str(model_path), threads)
+        model, processor = (
+            factory(str(model_path), threads, offload_folder=str(offload_folder))
+            if offload_folder is not None else factory(str(model_path), threads)
+        )
         return lambda input_path, duration: qwen_transcribe(model, processor, input_path, duration)
     else:  # pragma: no cover - guarded by argparse choices
         raise AdapterError(f"Unknown engine: {engine}")
@@ -653,7 +735,8 @@ def serve(
                     f"key, got: {line!r}"
                 )
             input_path, duration = validate_input_wav(request["input"])
-            raw_result = transcribe_fn(str(input_path), duration)
+            with contextlib.redirect_stdout(sys.stderr):
+                raw_result = transcribe_fn(str(input_path), duration)
             result = build_result(raw_result["text"], raw_result["language"], raw_result["segments"])
         except AdapterError as exc:
             error_message = str(exc)
@@ -688,6 +771,7 @@ def run(
     try:
         threads = validate_threads(args.threads)
         model_path = validate_model_path(args.engine, args.model)
+        offload_folder = validate_offload_dir(args.engine, model_path, args.offload_dir)
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -697,14 +781,16 @@ def run(
 
     if args.serve:
         try:
-            transcribe_fn = build_transcribe_fn(
-                args.engine,
-                model_path,
-                threads,
-                nemo_model_factory=nemo_model_factory,
-                whisper_pipeline_factory=whisper_pipeline_factory,
-                qwen_model_factory=qwen_model_factory,
-            )
+            with contextlib.redirect_stdout(sys.stderr):
+                transcribe_fn = build_transcribe_fn(
+                    args.engine,
+                    model_path,
+                    threads,
+                    offload_folder=offload_folder,
+                    nemo_model_factory=nemo_model_factory,
+                    whisper_pipeline_factory=whisper_pipeline_factory,
+                    qwen_model_factory=qwen_model_factory,
+                )
         except AdapterError as exc:
             print(f"error: {exc}", file=sys.stderr)
             (out_stream or sys.stdout).write(json.dumps({"error": str(exc)}, ensure_ascii=False) + "\n")
@@ -723,6 +809,7 @@ def run(
             args.engine,
             model_path,
             threads,
+            offload_folder=offload_folder,
             nemo_model_factory=nemo_model_factory,
             whisper_pipeline_factory=whisper_pipeline_factory,
             qwen_model_factory=qwen_model_factory,

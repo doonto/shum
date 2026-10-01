@@ -23,6 +23,7 @@ qwen = [
     "torch>=2.2",
     "transformers>=4.57.6",
     "accelerate>=0.30.0",
+    "librosa>=0.10.0",
 ]
 dev = [
     "pytest>=8.0",

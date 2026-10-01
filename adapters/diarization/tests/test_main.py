@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import sys
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +63,10 @@ def test_parse_args_ok():
     assert args.input == "/i.wav"
     assert args.output == "/o.json"
     assert args.threads == 4
+    assert args.segmentation_batch_size == 1
+    assert args.embedding_batch_size == 1
+    assert not args.profile
+    assert not args.preload_audio
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +312,115 @@ def test_run_success_writes_expected_json(tmp_path):
         "turns": [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}],
         "exclusive_turns": [{"start": 0.0, "end": 1.5, "speaker": "SPEAKER_00"}],
     }
+
+
+def test_run_configures_batches_and_profiles_stages(tmp_path, capsys):
+    model_dir = _make_model_dir(tmp_path)
+    wav_path = tmp_path / "audio.wav"
+    write_wav(wav_path, channels=1, rate=16000)
+    output_path = tmp_path / "result.json"
+    fake_output = SimpleNamespace(
+        speaker_diarization=FakeAnnotation([]),
+        exclusive_speaker_diarization=FakeAnnotation([]),
+    )
+
+    class FakePipeline:
+        segmentation_batch_size = 1
+        embedding_batch_size = 1
+
+        def __call__(self, input_path, *, hook):
+            assert input_path == str(wav_path)
+            assert self.segmentation_batch_size == 16
+            assert self.embedding_batch_size == 32
+            hook("segmentation", None, total=10, completed=1)
+            hook("segmentation", None, total=10, completed=1)
+            hook("segmentation", None, total=10, completed=2)
+            hook("segmentation", None)
+            hook("embeddings", None)
+            return fake_output
+
+    assert main.run(
+        [
+            "--model", str(model_dir), "--input", str(wav_path),
+            "--output", str(output_path), "--threads", "4",
+            "--segmentation-batch-size", "16", "--embedding-batch-size", "32",
+            "--profile",
+        ],
+        pipeline_factory=lambda _model, _threads: FakePipeline(),
+    ) == 0
+    assert json.loads(output_path.read_text()) == {"turns": [], "exclusive_turns": []}
+    captured = capsys.readouterr()
+    assert captured.err.count("diarization segmentation:") == 1
+    assert captured.err.count("diarization segmentation progress 10%:") == 1
+    assert captured.err.count("diarization segmentation progress 20%:") == 1
+    assert "diarization embeddings:" in captured.err
+    assert "diarization total:" in captured.err
+
+
+def test_run_preloads_once_and_keeps_global_speaker_timeline(tmp_path, capsys, monkeypatch):
+    model_dir = _make_model_dir(tmp_path)
+    wav_path = tmp_path / "audio.wav"
+    write_wav(wav_path, channels=1, rate=16000)
+    output_path = tmp_path / "result.json"
+    waveform = object()
+    calls = []
+
+    def fake_loader(path):
+        calls.append(path)
+        return {"waveform": waveform, "sample_rate": 16000}
+
+    monkeypatch.setattr(main, "load_waveform", fake_loader)
+    fake_output = SimpleNamespace(
+        speaker_diarization=FakeAnnotation([(FakeSegment(0.0, 2.0), None, "SPEAKER_00")]),
+        exclusive_speaker_diarization=FakeAnnotation(
+            [(FakeSegment(0.0, 2.0), None, "SPEAKER_00")]
+        ),
+    )
+
+    def fake_pipeline(audio_input, *, hook):
+        assert audio_input == {"waveform": waveform, "sample_rate": 16000}
+        hook("segmentation", None)
+        return fake_output
+
+    assert main.run(
+        [
+            "--model", str(model_dir), "--input", str(wav_path),
+            "--output", str(output_path), "--threads", "4",
+            "--preload-audio", "--profile",
+        ],
+        pipeline_factory=lambda *_: fake_pipeline,
+    ) == 0
+    assert calls == [str(wav_path)]
+    assert json.loads(output_path.read_text())["exclusive_turns"][0]["speaker"] == "SPEAKER_00"
+    assert "diarization waveform load:" in capsys.readouterr().err
+
+
+def test_preloaded_waveform_must_still_be_mono_and_16khz(monkeypatch):
+    audio = SimpleNamespace(shape=(1, 160))
+    monkeypatch.setitem(
+        sys.modules,
+        "torchaudio",
+        SimpleNamespace(load=lambda _path: (audio, 8000)),
+    )
+    with pytest.raises(main.AdapterError, match="mono at 16 kHz"):
+        main.load_waveform("/tmp/audio.wav")
+
+
+def test_invalid_batch_size_fails_before_loading_model(tmp_path, capsys):
+    model_dir = _make_model_dir(tmp_path)
+    wav_path = tmp_path / "audio.wav"
+    write_wav(wav_path, channels=1, rate=16000)
+    output_path = tmp_path / "result.json"
+    assert main.run(
+        [
+            "--model", str(model_dir), "--input", str(wav_path),
+            "--output", str(output_path), "--threads", "4",
+            "--embedding-batch-size", "0",
+        ],
+        pipeline_factory=lambda *_: pytest.fail("must not load the model"),
+    ) == 1
+    assert not output_path.exists()
+    assert "--embedding-batch-size must be positive" in capsys.readouterr().err
 
 
 def test_run_reports_explicit_error_for_missing_model(tmp_path, capsys):

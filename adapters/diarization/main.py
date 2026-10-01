@@ -35,6 +35,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import wave
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -80,6 +81,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         help="Number of CPU threads to use for inference.",
+    )
+    parser.add_argument(
+        "--segmentation-batch-size", type=int, default=1,
+        help="Segmentation inference batch size (default: 1).",
+    )
+    parser.add_argument(
+        "--embedding-batch-size", type=int, default=1,
+        help="Speaker embedding batch size (default: 1).",
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Log elapsed time for diarization stages to stderr; never log audio or speech.",
+    )
+    parser.add_argument(
+        "--preload-audio", action="store_true",
+        help="Load the whole WAV into RAM once so embedding crops avoid repeated file decoding.",
     )
     return parser
 
@@ -225,11 +242,70 @@ def default_pipeline_factory(model_dir: str, threads: int) -> Any:
     return pipeline
 
 
-def run_pipeline(pipeline: Any, input_path: str) -> Any:
+def run_pipeline(pipeline: Any, audio_input: Any, **options: Any) -> Any:
     try:
-        return pipeline(input_path)
+        return pipeline(audio_input, **options)
     except Exception as exc:
-        raise AdapterError(f"Diarization failed for {input_path!r}: {exc}") from exc
+        raise AdapterError(f"Diarization failed: {exc}") from exc
+
+
+def load_waveform(input_path: str) -> dict[str, Any]:
+    try:
+        import torchaudio
+    except ImportError as exc:
+        raise AdapterError("Missing dependency: torchaudio is required for --preload-audio") from exc
+    try:
+        waveform, sample_rate = torchaudio.load(input_path)
+    except Exception as exc:
+        raise AdapterError(f"Cannot preload WAV: {exc}") from exc
+    if sample_rate != 16000 or waveform.shape[0] != 1:
+        raise AdapterError("Preloaded audio must be mono at 16 kHz")
+    return {"waveform": waveform, "sample_rate": sample_rate}
+
+
+def configure_batch_sizes(pipeline: Any, segmentation: int, embedding: int) -> None:
+    for name, size in (
+        ("segmentation_batch_size", segmentation),
+        ("embedding_batch_size", embedding),
+    ):
+        if size < 1:
+            raise AdapterError(f"--{name.replace('_', '-')} must be positive, got {size}")
+        if size != 1:
+            if not hasattr(pipeline, name):
+                raise AdapterError(f"Loaded diarization pipeline does not support {name}")
+            setattr(pipeline, name, size)
+
+
+def run_profiled_pipeline(pipeline: Any, audio_input: Any, **options: Any) -> Any:
+    started = time.perf_counter()
+    previous = started
+    progress: dict[str, int] = {}
+
+    def hook(step: str, _artifact: Any, **kwargs: Any) -> None:
+        nonlocal previous
+        if kwargs.get("total") is not None:
+            total = kwargs["total"]
+            completed = kwargs.get("completed", 0)
+            if total > 0:
+                tenths = min(10, completed * 10 // total)
+                if tenths > progress.get(step, 0) and tenths < 10:
+                    progress[step] = tenths
+                    print(
+                        f"diarization {step} progress {tenths * 10}%:"
+                        f" {time.perf_counter() - started:.2f}s elapsed",
+                        file=sys.stderr,
+                    )
+            return
+        now = time.perf_counter()
+        print(f"diarization {step}: {now - previous:.2f}s", file=sys.stderr)
+        previous = now
+
+    try:
+        result = pipeline(audio_input, hook=hook, **options)
+    except Exception as exc:
+        raise AdapterError(f"Diarization failed: {exc}") from exc
+    print(f"diarization total: {time.perf_counter() - started:.2f}s", file=sys.stderr)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +373,34 @@ def run(argv: Sequence[str] | None = None, pipeline_factory: PipelineFactory | N
         model_path = validate_model_dir(args.model)
         input_path = validate_input_wav(args.input)
         output_path = validate_output_path(args.output)
+        for name, size in (
+            ("segmentation-batch-size", args.segmentation_batch_size),
+            ("embedding-batch-size", args.embedding_batch_size),
+        ):
+            if size < 1:
+                raise AdapterError(f"--{name} must be positive, got {size}")
 
         configure_offline_environment()
         configure_thread_environment(threads)
 
         factory = pipeline_factory or default_pipeline_factory
         pipeline = factory(str(model_path), threads)
-        diarization_output = run_pipeline(pipeline, str(input_path))
+        configure_batch_sizes(
+            pipeline, args.segmentation_batch_size, args.embedding_batch_size,
+        )
+        audio_input: Any = str(input_path)
+        if args.preload_audio:
+            loading_started = time.perf_counter()
+            audio_input = load_waveform(str(input_path))
+            if args.profile:
+                print(
+                    f"diarization waveform load: {time.perf_counter() - loading_started:.2f}s",
+                    file=sys.stderr,
+                )
+        diarization_output = (
+            run_profiled_pipeline(pipeline, audio_input)
+            if args.profile else run_pipeline(pipeline, audio_input)
+        )
         result = diarization_output_to_result(diarization_output)
         write_result(result, output_path)
     except AdapterError as exc:

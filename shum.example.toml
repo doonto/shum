@@ -1,4 +1,5 @@
-# Copy to shum.toml and set the interpreter paths after installing the adapters.
+# Template imported by `shum --onboarding` into the private per-user config.
+# Do not store the editable config or model weights in the source tree.
 # An empty revision means the model has not yet been installed.
 # Optional: review_rules = "rules.txt" (domain vocabulary/style for the LLM;
 # cannot override the rule against inventing words).
@@ -41,11 +42,50 @@ threads = 6
 program = "adapters/asr/.venv-qwen/bin/python"
 script = "adapters/asr/main.py"
 threads = 6
+# Experimental shared GGUF server: see adapters/asr/README.md for the
+# *original* Qwen model revision, pinned GGUF hashes and required args.
+# max_in_flight = 4
 
 [diarization]
 program = "adapters/diarization/.venv/bin/python"
 script = "adapters/diarization/main.py"
 threads = 4
+
+# Tune estimates to measured peaks on this machine. The scheduler reserves
+# memory for the OS and admits fewer ASR workers if RAM is already in use.
+[resources]
+reserve_mib = 4096
+max_asr_workers = 3
+oom_retries = 2
+# Optional: enable tested CPU/disk offload for Flix and Qwen only. Directory
+# must be private (0700) and outside original model snapshots.
+# offload_dir = "/absolute/shum-data/projects/.asr-offload"
+# When using a faster engine without Accelerate offload for Flix, set ["qwen"].
+offload_roles = ["flix", "qwen"]
+offload_min_free_mib = 8192
+# Opt-in on Ubuntu with a running systemd --user manager. Required to confirm
+# OOM kills and retry them; otherwise worker failure stops the job.
+supervise_asr_with_systemd = false
+# Optional hard RAM limit per isolated worker; requires systemd supervision.
+# A limit below the model's loading/generation peak can cause repeated OOM.
+# systemd_memory_limit_mib = 16000
+
+[resources.estimated_peak_mib]
+primeline = 6000
+flix = 10500
+qwen = 13500
+
+[resources.offload_estimated_peak_mib]
+flix = 6500
+qwen = 7000
+
+# Optional after benchmarking and reviewing the exact adapter's audio quality.
+# The scheduler counts these processes against max_asr_workers and available
+# RAM, and uses one process under memory pressure or --sequential-asr.
+# [resources.asr_worker_counts]
+# flix = 3
+# [resources.asr_worker_peak_mib]
+# flix = 2600
 
 # Codex reads a prompt from stdin and writes the last response to {output}.
 # Replace with another CLI and arguments if desired; its response must match

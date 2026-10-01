@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import io
 import json
+import stat
+import sys
+import types
 import wave
 from pathlib import Path
 
@@ -115,7 +118,8 @@ class FakeTensor:
         return (len(self._rows), len(self._rows[0]) if self._rows else 0)
 
     def __getitem__(self, item):
-        # Only used as inputs["input_ids"].shape[1] in the adapter; not sliced further here.
+        if isinstance(item, tuple) and all(isinstance(index, int) for index in item):
+            return types.SimpleNamespace(item=lambda: self._rows[item[0]][item[1]])
         return self
 
 
@@ -124,8 +128,11 @@ class FakeQwenModel:
         self.device = "cpu"
         self.dtype = "float32"
         self._generated_ids = generated_ids
+        self.generation_config = types.SimpleNamespace(max_new_tokens=512, eos_token_id=[151643, 151645])
+        self.generate_kwargs = None
 
     def generate(self, **kwargs):
+        self.generate_kwargs = kwargs
         return self._generated_ids
 
 
@@ -164,6 +171,16 @@ def test_parse_args_serve_ok_without_input_output():
     assert args.serve is True
     assert args.input is None
     assert args.output is None
+
+
+def test_parse_args_offload_is_opt_in():
+    args = main.parse_args(["--engine", "qwen", "--model", "/m", "--threads", "2", "--serve"])
+    assert args.offload_dir is None
+    args = main.parse_args([
+        "--engine", "qwen", "--model", "/m", "--threads", "2", "--serve",
+        "--offload-dir", "/private/cache",
+    ])
+    assert args.offload_dir == "/private/cache"
 
 
 def test_parse_args_serve_rejects_input():
@@ -217,6 +234,97 @@ def test_validate_model_path_nemo_dir_with_no_nemo_file(tmp_path):
     (empty_dir / "readme.txt").write_text("not a checkpoint\n")
     with pytest.raises(main.AdapterError, match="no '\\.nemo' checkpoint file"):
         main.validate_model_path("nemo", str(empty_dir))
+
+
+def test_offload_cache_is_private_per_engine_and_revision(tmp_path):
+    model_a = make_transformers_checkpoint_dir(tmp_path, "a" * 40)
+    model_b = make_transformers_checkpoint_dir(tmp_path, "b" * 40)
+    root = tmp_path / "private-cache"
+    whisper = main.validate_offload_dir("whisper", model_a, str(root))
+    assert whisper == main.validate_offload_dir("whisper", model_a, str(root))
+    assert whisper != main.validate_offload_dir("whisper", model_b, str(root))
+    assert whisper != main.validate_offload_dir("qwen", model_a, str(root))
+    assert whisper.parent.name == "whisper"
+    assert "a" * 40 in whisper.name
+    for directory in (root, whisper.parent, whisper):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_offload_cache_rejects_unsafe_paths_without_changing_snapshot(tmp_path):
+    model_dir = make_transformers_checkpoint_dir(tmp_path)
+    with pytest.raises(main.AdapterError, match="only for whisper and qwen"):
+        main.validate_offload_dir("nemo", model_dir, str(tmp_path / "offload"))
+    with pytest.raises(main.AdapterError, match="absolute"):
+        main.validate_offload_dir("qwen", model_dir, "relative")
+    with pytest.raises(main.AdapterError, match="inside the model snapshot"):
+        main.validate_offload_dir("qwen", model_dir, str(model_dir / "offload"))
+    assert not (model_dir / "offload").exists()
+    public = tmp_path / "public"
+    public.mkdir(mode=0o755)
+    with pytest.raises(main.AdapterError, match="private directory"):
+        main.validate_offload_dir("whisper", model_dir, str(public))
+    symlink = tmp_path / "alias"
+    symlink.symlink_to(model_dir, target_is_directory=True)
+    with pytest.raises(main.AdapterError, match="symlink"):
+        main.validate_offload_dir("whisper", model_dir, str(symlink))
+
+
+@pytest.mark.parametrize("engine", ["whisper", "qwen"])
+def test_default_factory_uses_cpu_disk_offload_without_moving_model(monkeypatch, engine):
+    calls = {}
+    class FakeTorch:
+        float32 = "float32"
+
+        @staticmethod
+        def set_num_threads(threads):
+            calls["threads"] = threads
+
+    class FakeProcessor:
+        tokenizer = "tokenizer"
+        feature_extractor = "feature_extractor"
+
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            calls["processor"] = kwargs
+            return cls()
+
+    class FakeModel:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            calls["load"] = kwargs
+            return cls()
+
+        def to(self, device):
+            calls["moved"] = device
+
+        def eval(self):
+            calls["eval"] = True
+
+    def fake_pipeline(**kwargs):
+        calls["pipeline"] = kwargs
+        return "pipeline"
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(
+        AutoModelForSpeechSeq2Seq=FakeModel,
+        AutoModelForMultimodalLM=FakeModel,
+        AutoProcessor=FakeProcessor,
+        pipeline=fake_pipeline,
+    ))
+    if engine == "whisper":
+        assert main.default_whisper_pipeline_factory("/model", 2, offload_folder="/cache") == "pipeline"
+        assert "device" not in calls["pipeline"]
+    else:
+        assert main.default_qwen_model_factory("/model", 2, offload_folder="/cache")[0].__class__ is FakeModel
+        assert calls["eval"] is True
+        assert "moved" not in calls
+    assert calls["threads"] == 2
+    assert calls["processor"] == {"local_files_only": True}
+    assert calls["load"] == {
+        "dtype": "float32", "local_files_only": True,
+        "device_map": "auto", "max_memory": {"cpu": "2GiB"},
+        "offload_folder": "/cache", "offload_state_dict": True,
+    }
 
 
 def test_validate_model_path_nemo_dir_with_multiple_nemo_files(tmp_path):
@@ -484,6 +592,14 @@ def test_qwen_transcribe_reports_single_full_length_segment():
     assert result["text"] == "hello there"
     assert result["language"] == "English"
     assert result["segments"] == [{"start": 0.0, "end": 4.2, "text": "hello there"}]
+    assert model.generate_kwargs["max_new_tokens"] == 512
+
+
+def test_qwen_transcribe_rejects_unfinished_generation_at_model_limit():
+    model = FakeQwenModel(generated_ids=FakeTensor([[1, 2, 3, *([123] * 512)]]))
+    processor = FakeQwenProcessor(parsed=[{"language": "German", "transcription": "partial"}])
+    with pytest.raises(main.AdapterError, match="without EOS"):
+        main.qwen_transcribe(model, processor, "/audio.wav", duration=28.0)
 
 
 def test_qwen_transcribe_handles_empty_transcription():
@@ -686,6 +802,28 @@ def test_serve_processes_two_requests_with_model_loaded_only_once(tmp_path):
     }
 
 
+def test_serve_keeps_model_stdout_out_of_json_protocol(tmp_path, capsys):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, rate=16000, n_frames=16000)
+
+    def noisy_transcribe(_path, duration):
+        print("[NeMo I] loading model")
+        return {
+            "text": "hallo",
+            "language": None,
+            "segments": [{"start": 0.0, "end": duration, "text": "hallo"}],
+        }
+
+    out_stream = io.StringIO()
+    assert main.serve(
+        noisy_transcribe,
+        in_stream=io.StringIO(json.dumps({"input": str(wav)}) + "\n"),
+        out_stream=out_stream,
+    ) == 0
+    assert json.loads(out_stream.getvalue())["text"] == "hallo"
+    assert "[NeMo I] loading model" in capsys.readouterr().err
+
+
 def test_serve_skips_blank_lines_between_requests(tmp_path):
     wav_a = tmp_path / "a.wav"
     write_wav(wav_a, rate=16000, n_frames=16000)
@@ -847,6 +985,39 @@ def test_run_serve_writes_json_only_to_stdout(tmp_path):
     for line in out_stream.getvalue().splitlines():
         if line.strip():
             json.loads(line)  # raises if any non-JSON text leaked onto stdout
+
+
+@pytest.mark.parametrize("engine", ["whisper", "qwen"])
+def test_run_serve_offload_loads_once_and_keeps_json_protocol(tmp_path, engine):
+    model_dir = make_transformers_checkpoint_dir(tmp_path)
+    wav = tmp_path / "clip.wav"
+    write_wav(wav, rate=16000, n_frames=16000)
+    offload = tmp_path / "offload"
+    calls = []
+
+    def factory(path, threads, *, offload_folder):
+        calls.append((path, threads, offload_folder))
+        if engine == "whisper":
+            return FakeWhisperPipeline({
+                "text": "hallo",
+                "chunks": [{"text": "hallo", "timestamp": (0, 1), "language": "german"}],
+            })
+        return FakeQwenModel(FakeTensor([[1, 2]])), FakeQwenProcessor([
+            {"language": "German", "transcription": "hallo"},
+        ])
+
+    output = io.StringIO()
+    assert main.run(
+        ["--engine", engine, "--model", str(model_dir), "--threads", "2",
+         "--offload-dir", str(offload), "--serve"],
+        **{f"{engine}_pipeline_factory" if engine == "whisper" else "qwen_model_factory": factory},
+        in_stream=io.StringIO((json.dumps({"input": str(wav)}) + "\n") * 2),
+        out_stream=output,
+    ) == 0
+    assert len(calls) == 1
+    assert calls[0][0:2] == (str(model_dir), 2)
+    assert Path(calls[0][2]).is_dir()
+    assert [json.loads(line)["text"] for line in output.getvalue().splitlines()] == ["hallo", "hallo"]
 
 
 def test_run_serve_configures_offline_and_thread_env_exactly_once(tmp_path, monkeypatch):
