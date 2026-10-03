@@ -14,7 +14,7 @@
 # torch/transformers are only required for flix_fast_convert.py (loading the
 # original HF checkpoint to convert it); flix_fast_worker.py itself only
 # needs ctranslate2 + faster-whisper at runtime.
-ctranslate2>=4.0,<5
+ctranslate2>=4.8.2,<5
 faster-whisper==1.2.1
-torch>=2.2
-transformers>=4.57.6
+torch>=2.14.1
+transformers>=5.18.0

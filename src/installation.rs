@@ -366,6 +366,8 @@ pub fn prepare_environments(root: &Path, runtime: &Path, config: &Config) -> Res
             [
                 "pip",
                 "install",
+                "--torch-backend",
+                "cpu",
                 "--python",
                 venv.join("bin/python")
                     .to_str()

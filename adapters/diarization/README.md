@@ -30,6 +30,18 @@ the JSON file it writes.
 
 ## Install
 
+The pinned native stack resolves to CPU wheels on Linux with Python 3.10-3.14.
+Torch and TorchAudio are both 2.11.0: TorchAudio 2.11 is the newest
+published matching release, even though Torch itself has newer releases.
+TorchAudio's stable ABI officially supports Torch 2.11 and later, including
+2.14, but this environment deliberately pins the same release on both sides.
+TorchCodec 0.17.0 supports Torch 2.11 and later. `--torch-backend cpu` selects
+CPU wheels for all three with `uv`; without that option, the default PyPI
+install can select CUDA-enabled Torch wheels, although inference still runs
+on CPU. These pins and wheel resolutions do not establish model inference
+compatibility; verify the native imports and pipeline on a newly provisioned
+environment before deployment.
+
 Requires Python 3.10+ and `uv`. Run `bash scripts/install.sh` from the
 source checkout and choose the installation, settings, projects, and models
 directories. The onboarding wizard offers to create this environment after
@@ -48,6 +60,7 @@ SHUM_ROOT=/absolute/path/to/selected/installation
 DIAR_DIR=/absolute/path/to/installed/runtime/adapters/diarization
 uv venv "$SHUM_ROOT/runtime/environments/diarization"
 uv pip install --python "$SHUM_ROOT/runtime/environments/diarization/bin/python" \
+    --torch-backend cpu \
     -r "$DIAR_DIR/requirements.txt"
 ```
 

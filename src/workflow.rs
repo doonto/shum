@@ -505,9 +505,20 @@ fn validate_legacy(project: &Path, input: &Path, step: &str) -> Result<bool> {
         .is_some())
 }
 
+struct ProjectLock(File);
+
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        // Closing alone leaves flock held while a forked child still has the descriptor.
+        if let Err(error) = fs2::FileExt::unlock(&self.0) {
+            eprintln!("could not release project lock: {error:#}");
+        }
+    }
+}
+
 pub struct Project {
     root: PathBuf,
-    _lock: File,
+    _lock: ProjectLock,
     pub status: ProjectStatus,
     execution: execution::Handle,
 }
@@ -530,6 +541,7 @@ impl Project {
             .open(root.join(".workflow.lock"))?;
         lock.try_lock_exclusive()
             .context("project is already in use")?;
+        let lock = ProjectLock(lock);
         let hash = &manifest.input_sha256;
         let initial_stem = source_stem(input)?;
         let input = input
@@ -1290,6 +1302,18 @@ mod tests {
         for step in ["asr:flix", "review-flags", "review", "export"] {
             assert_ne!(changed[step], previous[step]);
         }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn dropping_project_releases_lock_even_with_an_inherited_descriptor() {
+        let (path, input, manifest) = fixture();
+        let project = Project::open(&path, &input, &manifest, None, None).unwrap();
+        let inherited = project._lock.0.try_clone().unwrap();
+        drop(project);
+        let reopened = Project::open(&path, &input, &manifest, None, None).unwrap();
+        drop(reopened);
+        drop(inherited);
         fs::remove_dir_all(path).unwrap();
     }
 

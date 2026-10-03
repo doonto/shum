@@ -379,11 +379,13 @@ resident memory but slows every clip, especially Qwen3-ASR.
 ## Install (isolated per-engine `uv` environments)
 
 Requires Python 3.10+ and [`uv`](https://docs.astral.sh/uv/) 0.5.3+.
+The Qwen extra retains `librosa>=0.11.0` because librosa 1.0.0 requires
+Python 3.12+, while these engines still support Python 3.10.
 
 The three engines pull in large, and sometimes mutually incompatible,
 dependency trees (`nemo_toolkit[asr]` bundles its own PyTorch
 Lightning/Hydra/OmegaConf stack; `transformers` for Qwen3-ASR requires a
-recent `>=4.57.6` release that may not be what `nemo_toolkit` expects).
+recent `>=5.18.0` release that may not be what `nemo_toolkit` expects).
 Run `bash scripts/install.sh` from a source checkout to build the portable
 binary and choose its installation, settings, projects, and models directories.
 The onboarding wizard offers to prepare separate environments with `uv` after
@@ -420,10 +422,12 @@ Use `--extra nemo` with `primeline` or `--extra qwen` with `qwen` in the
 same commands for the other engines. Set `ASR_DIR` from the current config,
 not by sorting runtime release directories: older releases can coexist.
 
-`pyproject.toml` pins `torch` to PyTorch's CPU-only wheel index
-(`download.pytorch.org/whl/cpu`) for every extra, so `uv sync` never pulls a
-CUDA build, on any platform (verified: `uv sync --extra whisper` on this
-repo resolves `torch==2.14.0+cpu`).
+`pyproject.toml` routes `torch`, `torchaudio`, and `torchcodec` to PyTorch's
+CPU-only wheel index (`download.pytorch.org/whl/cpu`) for every extra, so a
+future transitive audio dependency cannot pull a CUDA wheel from PyPI alongside
+CPU Torch. The current NeMo `[asr]` lock contains no TorchAudio or TorchCodec;
+on Linux it resolves `torch==2.14.1+cpu`. This checks package provenance, not
+NeMo model inference or native imports.
 
 ### Obtaining the checkpoints
 

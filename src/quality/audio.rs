@@ -349,8 +349,8 @@ pub fn analyze(wav: &Path, chunks: &[Interval], settings: &Settings) -> Result<R
                     .unwrap_or(u64::MAX);
             }
             let mut pair = [0.0; 2];
-            for (channel, sample_bytes) in bytes.chunks_exact(2).enumerate() {
-                let sample = f64::from(i16::from_le_bytes(sample_bytes.try_into()?)) / 32768.0;
+            for (channel, sample_bytes) in bytes.as_chunks::<2>().0.iter().enumerate() {
+                let sample = f64::from(i16::from_le_bytes(*sample_bytes)) / 32768.0;
                 overall.push(sample, settings);
                 channel_acc[channel].push(sample, settings);
                 for &i in &active {
@@ -602,9 +602,8 @@ pub fn analyze_channels(source: &Path, settings: &Settings) -> Result<Report> {
                 break;
             }
             let mut stereo = [0.0; 2];
-            for (index, sample_bytes) in bytes.chunks_exact(2).enumerate() {
-                let sample =
-                    f64::from(i16::from_le_bytes([sample_bytes[0], sample_bytes[1]])) / 32768.0;
+            for (index, sample_bytes) in bytes.as_chunks::<2>().0.iter().enumerate() {
+                let sample = f64::from(i16::from_le_bytes(*sample_bytes)) / 32768.0;
                 overall.push(sample, settings);
                 channels[index].push(sample, settings);
                 if channel_count == 2 {

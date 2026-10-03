@@ -8,24 +8,39 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.0.0
         with:
-          python-version: "3.11"
+          node-version: "26"
+          check-latest: true
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+          check-latest: true
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+          python --version
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Rust formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: Rust lint
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Rust tests
-        run: cargo test
+        run: cargo test --locked
       - name: Adapter unit tests
         run: |
-          python -m pip install pytest
+          python -m pip install --upgrade pytest numpy onnx
           python -m pytest -q adapters/asr/tests
           python -m pytest -q adapters/diarization/tests
+      - name: Workflow and headless integration tests
+        run: |
+          cargo build --locked
+          python -m pytest -q tests/test_api_integration.py tests/test_execution_integration.py tests/test_headless.py

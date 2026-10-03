@@ -194,6 +194,9 @@ This experiment is **not** installed by the normal onboarding wizard.
 Use the `flix_fast_requirements.txt` shipped with the installed adapter
 runtime. Set `ASR_DIR` to the parent of the installed `[asr.flix].script`
 path in `config.toml`; do not install packages in the source checkout.
+This Python 3.11 environment is also used by the Turbo worker. Its pinned
+NumPy 2.4.6 and PyAV 18.1.0 are the newest releases with Python 3.11 wheels;
+NumPy 2.5.3 and PyAV 19.0.1 require Python 3.12+.
 
 ```bash
 SHUM_ROOT=/absolute/path/to/selected/installation

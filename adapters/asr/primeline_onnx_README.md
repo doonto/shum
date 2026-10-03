@@ -24,7 +24,7 @@ at `$SHUM_ROOT/models/primeline/3f1a9bcb611dfeda53fe74fe5f1a3d5701e8023e/`.
 The measured runtime used Python 3.13, `onnx-asr` 0.12.0, and
 `onnxruntime` 1.30.0; an isolated environment could live under
 `$XDG_CACHE_HOME/shum/prime-engine-onnx/.venv`.
-`primeline_onnx_requirements.txt` pins all six packages found in that
+`primeline_onnx_requirements.txt` pins all seven packages found in that
 environment; install it in a new isolated environment if needed.
 These are provenance references, **not** defaults embedded in the worker.
 Copy the export and model together to other absolute locations if needed.

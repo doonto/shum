@@ -174,7 +174,7 @@ impl InterruptGuard {
         // SAFETY: sigaction is initialized before use; the handler only writes an atomic.
         let previous = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = interrupt_handler as usize;
+            action.sa_sigaction = interrupt_handler as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = 0;
             let mut previous = std::mem::zeroed();

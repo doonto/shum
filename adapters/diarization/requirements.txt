@@ -1,8 +1,9 @@
 # Dependency manifest for the isolated pyannote Community-1 diarization adapter.
-# Install with: pip install -r requirements.txt
+# Install with: uv pip install --torch-backend cpu -r requirements.txt
 #
-# pyannote.audio>=4.0 is required for the Community-1 pipeline (exclusive
-# speaker diarization, bundled offline checkpoints). It requires Python 3.10+.
-pyannote.audio>=4.0,<5
-torch>=2.1,<3
-torchaudio>=2.1,<3
+# Community-1 requires pyannote.audio 4.x. TorchAudio 2.11.0 is the latest
+# published matching Torch release; TorchCodec 0.17 supports Torch >=2.11.
+pyannote.audio>=4.0.7,<5
+torch==2.11.0
+torchaudio==2.11.0
+torchcodec==0.17.0

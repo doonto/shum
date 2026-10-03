@@ -649,7 +649,7 @@ mod tests {
             readiness_with_timeout(&config, Duration::from_millis(40)),
             Readiness::TimedOut
         );
-        let (_dir, config) = cli("printf 'not the expected response'");
+        let (_dir, config) = cli("cat >/dev/null; printf 'not the expected response'");
         assert_eq!(readiness(&config), Readiness::InvalidResponse);
     }
 
