@@ -295,7 +295,7 @@ def test_run_success_writes_expected_json(tmp_path):
     def fake_factory(model_dir_arg, threads_arg):
         assert model_dir_arg == str(model_dir)
         assert threads_arg == 2
-        return lambda input_path: fake_output
+        return lambda input_path, *, hook: fake_output
 
     exit_code = main.run(
         [
@@ -336,6 +336,9 @@ def test_run_configures_batches_and_profiles_stages(tmp_path, capsys):
             hook("segmentation", None, total=10, completed=1)
             hook("segmentation", None, total=10, completed=2)
             hook("segmentation", None)
+            hook("embeddings", None, total=4, completed=0)
+            hook("embeddings", None, total=4, completed=1)
+            hook("embeddings", None, total=4, completed=4)
             hook("embeddings", None)
             return fake_output
 
@@ -355,6 +358,36 @@ def test_run_configures_batches_and_profiles_stages(tmp_path, capsys):
     assert captured.err.count("diarization segmentation progress 20%:") == 1
     assert "diarization embeddings:" in captured.err
     assert "diarization total:" in captured.err
+    measurements = [
+        json.loads(line)
+        for line in captured.err.splitlines()
+        if line.startswith('{"event":"shum.progress"')
+    ]
+    assert measurements == [
+        {"event": "shum.progress", "version": 1, "phase": "segmentation", "completed": 1, "total": 10},
+        {"event": "shum.progress", "version": 1, "phase": "segmentation", "completed": 2, "total": 10},
+        {"event": "shum.progress", "version": 1, "phase": "embeddings", "completed": 0, "total": 4},
+        {"event": "shum.progress", "version": 1, "phase": "embeddings", "completed": 1, "total": 4},
+        {"event": "shum.progress", "version": 1, "phase": "embeddings", "completed": 4, "total": 4},
+    ]
+
+
+def test_unprofiled_embedded_progress_uses_real_hook_counts(capsys):
+    class FakePipeline:
+        def __call__(self, _input, *, hook):
+            hook("embeddings", None, total=7, completed=0)
+            hook("embeddings", None, total=7, completed=2)
+            hook("embeddings", None, total=7, completed=2)
+            hook("embeddings", None, total=7, completed=7)
+            hook("embeddings", None)
+            return "done"
+
+    assert main.run_profiled_pipeline(FakePipeline(), "audio", profile=False) == "done"
+    assert capsys.readouterr().err.splitlines() == [
+        '{"event":"shum.progress","version":1,"phase":"embeddings","completed":0,"total":7}',
+        '{"event":"shum.progress","version":1,"phase":"embeddings","completed":2,"total":7}',
+        '{"event":"shum.progress","version":1,"phase":"embeddings","completed":7,"total":7}',
+    ]
 
 
 def test_run_preloads_once_and_keeps_global_speaker_timeline(tmp_path, capsys, monkeypatch):
@@ -466,3 +499,239 @@ def test_run_wraps_pipeline_failure_without_writing_output(tmp_path, capsys):
     assert not output_path.exists()
     captured = capsys.readouterr()
     assert "Diarization failed" in captured.err
+
+
+def profile_records(stderr):
+    return [
+        json.loads(line) for line in stderr.splitlines()
+        if line.startswith('{"event":"shum.profile"')
+    ]
+
+
+def test_profile_measures_hook_intervals_and_tail(monkeypatch, capsys):
+    clock = [10.0]
+    monkeypatch.setattr(main.time, "perf_counter", lambda: clock[0])
+
+    def pipeline(audio, *, hook, num_speakers):
+        assert audio == "unchanged"
+        assert num_speakers == 3
+        clock[0] = 12.0
+        hook("segmentation", None, completed=0, total=2)
+        clock[0] = 15.0
+        hook("segmentation", None, completed=2, total=2)
+        clock[0] = 16.0
+        hook("segmentation", None)
+        clock[0] = 17.0
+        hook("speaker_count", None)
+        clock[0] = 18.0
+        hook("embeddings", None, completed=0, total=4)
+        hook("embeddings", None, completed=0, total=4)
+        clock[0] = 22.0
+        hook("embeddings", None, completed=4, total=4)
+        clock[0] = 23.0
+        hook("embeddings", None)
+        clock[0] = 28.0
+        return "unchanged result"
+
+    assert main.run_profiled_pipeline(
+        pipeline, "unchanged", num_speakers=3,
+    ) == "unchanged result"
+    records = profile_records(capsys.readouterr().err)
+    assert all(r["event"] == "shum.profile" and r["version"] == 1 for r in records)
+    assert [r for r in records if r["status"] == "completed"] == [
+        {"event": "shum.profile", "version": 1, "phase": "segmentation",
+         "status": "completed", "elapsed_seconds": 6.0, "since": "pipeline_start",
+         "completed": 2, "total": 2},
+        {"event": "shum.profile", "version": 1, "phase": "embeddings",
+         "status": "completed", "elapsed_seconds": 6.0, "since": "speaker_count",
+         "completed": 4, "total": 4},
+        {"event": "shum.profile", "version": 1, "phase": "clustering_assembly",
+         "status": "completed", "elapsed_seconds": 5.0, "since": "embeddings"},
+        {"event": "shum.profile", "version": 1, "phase": "pipeline_total",
+         "status": "completed", "elapsed_seconds": 18.0},
+    ]
+    progress = [r for r in records if r["status"] == "progress"]
+    assert [(r["phase"], r["completed"], r["total"]) for r in progress] == [
+        ("segmentation", 0, 2), ("segmentation", 2, 2),
+        ("embeddings", 0, 4), ("embeddings", 4, 4),
+    ]
+    assert all("elapsed_seconds" not in r for r in progress)
+
+
+@pytest.mark.parametrize("after_embeddings", [False, True])
+def test_profile_failure_retains_partial_counts(monkeypatch, capsys, after_embeddings):
+    clock = [0.0]
+    monkeypatch.setattr(main.time, "perf_counter", lambda: clock[0])
+
+    def pipeline(_audio, *, hook):
+        clock[0] = 2.0
+        hook("segmentation", None)
+        hook("embeddings", None, completed=1, total=3)
+        if after_embeddings:
+            clock[0] = 5.0
+            hook("embeddings", None)
+        clock[0] = 8.0
+        raise RuntimeError("boom")
+
+    with pytest.raises(main.AdapterError, match="boom"):
+        main.run_profiled_pipeline(pipeline, "audio")
+    records = profile_records(capsys.readouterr().err)
+    failed = [r for r in records if r["status"] == "failed"]
+    assert failed[-1]["phase"] == "pipeline_total"
+    assert failed[-1]["elapsed_seconds"] == 8.0
+    assert failed[0]["phase"] == ("clustering_assembly" if after_embeddings else "embeddings")
+    assert failed[0]["elapsed_seconds"] == (3.0 if after_embeddings else 6.0)
+    if not after_embeddings:
+        assert failed[0]["completed"] == 1
+        assert failed[0]["total"] == 3
+    assert not any(r["phase"] == failed[0]["phase"] and r["status"] == "completed"
+                   for r in records)
+
+
+def test_profile_does_not_invent_missing_hook_timings(capsys):
+    assert main.run_profiled_pipeline(lambda _audio, **_: "ok", "audio") == "ok"
+    records = profile_records(capsys.readouterr().err)
+    assert [r["phase"] for r in records] == ["pipeline_total"]
+
+
+def test_profile_reports_effective_defaults_and_measured_lifecycle(tmp_path, monkeypatch, capsys):
+    model = _make_model_dir(tmp_path)
+    wav = tmp_path / "input.wav"
+    write_wav(wav)
+    out = tmp_path / "out.json"
+    clock = [0.0]
+    monkeypatch.setattr(main.time, "perf_counter", lambda: clock[0])
+    waveform = {"waveform": object(), "sample_rate": 16000}
+
+    class Pipeline:
+        segmentation_batch_size = 8
+        embedding_batch_size = 32
+
+        def __call__(self, audio, *, hook):
+            assert audio is waveform
+            clock[0] += 5.0
+            return SimpleNamespace(
+                speaker_diarization=FakeAnnotation([]),
+                exclusive_speaker_diarization=FakeAnnotation([]),
+            )
+
+    def factory(_model, threads):
+        assert threads == 4
+        clock[0] += 2.0
+        return Pipeline()
+
+    def preload(_path):
+        clock[0] += 3.0
+        return waveform
+
+    original_write = main.write_result
+
+    def write(result, path):
+        clock[0] += 7.0
+        original_write(result, path)
+
+    monkeypatch.setattr(main, "load_waveform", preload)
+    monkeypatch.setattr(main, "write_result", write)
+    assert main.run([
+        "--model", str(model), "--input", str(wav), "--output", str(out),
+        "--threads", "4", "--profile", "--preload-audio",
+    ], pipeline_factory=factory) == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"wrote {out}\n"
+    assert json.loads(out.read_text()) == {"turns": [], "exclusive_turns": []}
+    records = profile_records(captured.err)
+    configured = next(r for r in records if r["status"] == "configured")
+    assert configured["parameters"] == {
+        "threads": 4, "requested_segmentation_batch_size": 1,
+        "requested_embedding_batch_size": 1, "preload_audio": True,
+        "segmentation_batch_size": 8, "embedding_batch_size": 32,
+    }
+    assert "elapsed_seconds" not in configured
+    durations = {r["phase"]: r["elapsed_seconds"] for r in records
+                 if r["status"] == "completed"}
+    assert durations == {
+        "model_loading": 2.0, "batch_configuration": 0.0, "waveform_loading": 3.0,
+        "pipeline_total": 5.0, "result_conversion": 0.0, "result_writing": 7.0,
+    }
+
+
+@pytest.mark.parametrize("phase", [
+    "model_loading", "batch_configuration", "waveform_loading",
+    "result_conversion", "result_writing",
+])
+def test_profile_lifecycle_failure_is_not_success(tmp_path, monkeypatch, capsys, phase):
+    model = _make_model_dir(tmp_path)
+    wav = tmp_path / "input.wav"
+    write_wav(wav)
+    out = tmp_path / "out.json"
+
+    def fail(*_args):
+        raise main.AdapterError("injected failure")
+
+    output = SimpleNamespace(
+        speaker_diarization=FakeAnnotation([]),
+        exclusive_speaker_diarization=FakeAnnotation([]),
+    )
+    factory = lambda *_: lambda _audio, **_: output
+    if phase == "model_loading":
+        factory = fail
+    else:
+        target = {
+            "batch_configuration": "configure_batch_sizes",
+            "waveform_loading": "load_waveform",
+            "result_conversion": "diarization_output_to_result",
+            "result_writing": "write_result",
+        }[phase]
+        monkeypatch.setattr(main, target, fail)
+    args = [
+        "--model", str(model), "--input", str(wav), "--output", str(out),
+        "--threads", "1", "--profile",
+    ]
+    if phase == "waveform_loading":
+        args.append("--preload-audio")
+    assert main.run(args, pipeline_factory=factory) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error: injected failure" in captured.err
+    assert not out.exists()
+    records = profile_records(captured.err)
+    failed = [r for r in records if r["phase"] == phase]
+    assert len(failed) == 1
+    assert failed[0]["status"] == "failed"
+    assert failed[0]["elapsed_seconds"] >= 0
+
+
+def test_profile_reraises_unexpected_write_error(tmp_path, capsys):
+    with pytest.raises(TypeError):
+        with main.measured_phase("result_writing", True):
+            main.write_result({"bad": object()}, tmp_path / "out.json")
+    assert list(tmp_path.iterdir()) == []
+    assert profile_records(capsys.readouterr().err)[0]["status"] == "failed"
+
+
+def test_default_factory_keeps_local_cpu_and_thread_configuration(monkeypatch):
+    calls = []
+    pipeline = SimpleNamespace(to=lambda device: calls.append(("device", device)))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        set_num_threads=lambda n: calls.append(("threads", n)),
+        device=lambda name: name,
+    ))
+    monkeypatch.setitem(sys.modules, "pyannote.audio", SimpleNamespace(
+        Pipeline=SimpleNamespace(from_pretrained=lambda path: (
+            calls.append(("model", path)) or pipeline
+        )),
+    ))
+    assert main.default_pipeline_factory("/local/model", 3) is pipeline
+    assert calls == [("threads", 3), ("model", "/local/model"), ("device", "cpu")]
+
+
+def test_preloading_preserves_decoder_waveform_and_sample_rate(monkeypatch):
+    waveform = SimpleNamespace(shape=(1, 160))
+    calls = []
+    monkeypatch.setitem(sys.modules, "torchaudio", SimpleNamespace(
+        load=lambda path: (calls.append(path) or waveform, 16000),
+    ))
+    result = main.load_waveform("/local/audio.wav")
+    assert result["waveform"] is waveform
+    assert result["sample_rate"] == 16000
+    assert calls == ["/local/audio.wav"]

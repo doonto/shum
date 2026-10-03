@@ -4,7 +4,7 @@
 This is a standalone, not-yet-adopted prototype investigating a faster
 CPU-only inference path for the *original pinned* Flix SwissGerman Whisper
 checkpoint (`Flix-AI/flix-swissgerman-full`, see the pinned
-`<storage-dir>/models/flix/<revision>/.shum-manifest.json`), aiming for 30 minutes
+`<selected-models-dir>/flix/<revision>/.shum-manifest.json`), aiming for 30 minutes
 of audio in under 10 minutes on this machine (Intel i7-12850HX, 24 logical
 CPUs, CPU-only, no GPU). Conversion does not modify the original HF model
 snapshot or any existing job artifact.
@@ -25,6 +25,133 @@ mostly silent window also produced a repeated hallucination. Do not
 switch production to this adapter without an audio-grounded accuracy
 check and a safe response to suspect windows. See the
 [complete engine comparison](../../README.md#cpu-engine-comparison-on-one-recording).
+
+## Repeatability diagnostics
+
+The second diagnostic round verified all source-model and CT2 hashes and
+verified that all 67 clip PCM hashes match the corresponding intervals in
+the existing recording's first 1,800 seconds. A fresh **single** six-thread
+worker, INT8/VAD/beam 2 with fast decode, reproduced window 23's historical
+160-character answer exactly (repeated-four-gram fraction 0.71). That
+one-window pilot took 10.85 seconds including startup, with about 2.6 GiB
+sampled peak RSS. This is not a 30-minute benchmark or an accuracy result.
+Concurrent workers are therefore not necessary to reproduce this loop;
+its underlying cause and an audio-verified correction remain unresolved.
+
+`--diagnostics-dir /absolute/new/empty/directory` writes local `ready.json`
+and numbered request sidecars without changing the ordinary text/segments
+JSON. Sidecars include actual compute type, versions, thread settings,
+effective decode options, segment tokens/probabilities and retained VAD
+duration. The installed faster-whisper API does not expose retained VAD
+intervals, the number of fallback attempts, or a definitive truncation
+flag; these fields explicitly remain unavailable. Timestamp decoding is
+enabled in the current CT2 profile, even though the source generation
+config requests text-only output; cross-engine comparisons must account
+for that difference.
+
+The packaged [`flix_study.py`](../../scripts/flix_study.py) helper freezes
+an existing corpus and runs one persistent worker with a limit no greater
+than 600 seconds. It uses new private output directories, checks the
+frozen model and corpus hashes, and reserves at least 4 GiB. It stops on
+a reserve breach, growth in the worker process tree's own VmSwap, or new
+system swap-out together with memory PSI full avg10 at least 1.0%.
+System swap-in/out alone is recorded, not attributed to the worker.
+An earlier, overly strict swap-out-only guard stopped a sequence before
+returning a window; that report is preserved, not treated as a quality
+result. Missing counters fail safely; transient fork/exec status races
+are retried briefly rather than reported as zero memory.
+
+```bash
+python3 /absolute/runtime/scripts/flix_study.py freeze \
+  --source-model /absolute/models/flix/PINNED_REVISION \
+  --ct2-model /absolute/cache/flix/int8 \
+  --audio /absolute/prior-benchmark/audio.wav \
+  --clips-dir /absolute/prior-benchmark/clips \
+  --chunks-json /absolute/source-project/chunks.json \
+  --output /absolute/projects/new-flix-study
+python3 /absolute/runtime/scripts/flix_study.py run \
+  --manifest /absolute/projects/new-flix-study/corpus.json \
+  --output /absolute/projects/new-flix-study/fresh-window23 \
+  --indices 23 --timeout-seconds 600 \
+  --worker-command /absolute/environments/flix-fast/bin/python \
+  /absolute/runtime/adapters/asr/flix_fast_worker.py \
+  --model /absolute/models/flix/PINNED_REVISION \
+  --ct2-model /absolute/cache/flix/int8 \
+  --quantization int8 --threads 6 --serve --vad-filter --fast-decode --beam-size 2
+```
+
+`freeze` intentionally accepts only the pinned Flix revision
+`a9c347a904af5d31b28c537ac732e0618aed6136`, not an arbitrary model.
+`review --manifest CORPUS --study-dir STUDY --output NEW_JSON` creates a
+local audio-review list with time ranges and hypothesis variants. An
+optional `--historical-run DIRECTORY` requires all 67 historical WAV
+hashes to match; historical engine/weight attestations are explicitly
+not claimed. Review output remains `unverified`, with no WER/CER until a
+human reference is supplied.
+
+`run --full-corpus` selects all 67 windows instead of `--indices`.
+`full_speed_gate` is true only after all 67 finish strictly before 600
+seconds, including process/model startup. This is a speed result, not
+an accuracy claim; quality remains unverified.
+
+[`flix_matrix.py`](../../scripts/flix_matrix.py) runs selected short
+profiles sequentially with fresh model processes between profiles:
+
+```bash
+python3 /absolute/runtime/scripts/flix_matrix.py \
+  --manifest /absolute/projects/new-flix-study/corpus.json \
+  --output /absolute/projects/new-flix-study/paired \
+  --python /absolute/environments/flix-fast/bin/python \
+  --worker /absolute/runtime/adapters/asr/flix_fast_worker.py \
+  --threads 6 --profiles fast-repeat fallback-repeat
+```
+
+The repeated 8/23/52 sequence completed three times in each profile:
+120.26 seconds with fast decode (about 2.57 GiB peak RSS), and 140.94
+seconds with fallback (about 2.90 GiB). Fast decode repeated window 23
+every time, fraction 0.71. Fallback removed that loop but returned three
+different hypotheses, using final temperatures 0.2, 0.4, and 1.0.
+Windows 8 and 52 stayed identical in these repeats.
+
+`--seed` sets the CTranslate2 seed before model construction; optional
+`--reset-seed-per-request` requests another API call before each WAV,
+but does not guarantee native-worker reproducibility. With seed 0 and
+the reset request, three **fresh** processes on window 23 returned the
+same 141-character hypothesis at temperature 0.2, in 10.55, 10.59, and
+11.03 seconds. Do not infer that reseeding a persistent model clears its
+sampling state. Numerical CPU effects and native RNG lifecycle have not
+been causally isolated.
+
+Library VAD defaults include an unbounded positive-infinity duration.
+Diagnostics encode non-finite values as explicit strings with field
+paths; that known option is not an error. Unexpected non-finite metrics
+also emit a warning instead of silently becoming zero or dropping text.
+
+On the five VAD-empty windows, both fast and fallback profiles retained
+zero audio and produced empty text. Without VAD, fallback produced short
+hypotheses of 10/5/19/3/12 characters for windows 0/32/40/44/45; these may
+be real faint speech or hallucinations. The no-VAD six-window pilot took
+69.69 seconds; human listening is needed to distinguish those cases.
+The paired filtered quiet/control profiles took 25.94 and 26.84 seconds,
+with identical control-window text.
+
+A full single-worker, six-thread fallback/VAD run completed **59/67**
+before the strict 600-second deadline. Windows 59–66 remained missing;
+this profile fails the speed gate despite completing the short probes.
+Subsequent worker/thread configurations require fresh admission using
+the measured single-worker peak plus margin and the 4 GiB reserve.
+
+The next engine candidate is ONNX Runtime/Optimum ONNX, not a new model.
+The [metadata-only ONNX probe](./flix_onnx_README.md) originally found
+existing graphs without pinned-source export provenance and declined
+under conservative memory estimates. A subsequent bounded streaming audit
+verified every graph initializer against direct BF16-to-FP32 source values:
+all 1,259 source parameters are covered, including transposed weights,
+without loading a full model (about 190 MiB peak audit RSS).
+This verifies weights, not runtime operators or generation behavior.
+The separate diagnostic pilot uses a verified user-systemd cgroup with
+at most 9 GiB `MemoryMax`, zero swap and a 120-second window limit;
+it is not a production adapter or a full-corpus speed result.
 
 ## Why CTranslate2/faster-whisper (and not whisper.cpp)
 
@@ -55,19 +182,27 @@ check and a safe response to suspect windows. See the
 
 | File | Purpose |
 | --- | --- |
-| [`flix_fast_common.py`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/flix_fast_common.py) | Shared, dependency-light helpers (no `torch`/`ctranslate2` import): model-dir validation, manifest/provenance reading, cache-path resolution, WAV validation, atomic JSON writing. Used by both scripts below so their idempotency/cache logic can never disagree. |
-| [`flix_fast_convert.py`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/flix_fast_convert.py) | CLI: converts an original pinned HF Whisper checkpoint directory to a quantized CTranslate2 model directory, writes `preprocessor_config.json` + `flix-fast-provenance.json`. Idempotent (skips re-conversion when a matching provenance record already exists). |
-| [`flix_fast_worker.py`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/flix_fast_worker.py) | CLI-compatible worker: same `--model`/`--input`/`--output`/`--threads`/`--serve` contract and JSON output schema as `main.py --engine whisper`, backed by `faster-whisper`. Requires a pre-converted CTranslate2 directory (does **not** auto-convert, to avoid silently loading the full model into RAM on worker startup). |
-| [`flix_fast_requirements.txt`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/flix_fast_requirements.txt) | Pinned deps for an isolated `.venv-flix-fast` (not added to `pyproject.toml`, which is parent-owned). |
-| [`tests/test_flix_fast_common.py`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/tests/test_flix_fast_common.py), [`tests/test_flix_fast_convert.py`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/tests/test_flix_fast_convert.py), [`tests/test_flix_fast_worker.py`](/home/d/ya/Docs/01.SYY/50.Code/shum/adapters/asr/tests/test_flix_fast_worker.py) | Pure-Python unit tests (no `torch`/`ctranslate2`/`faster_whisper` required to run them — heavy calls are injected via factory parameters, same pattern as `tests/test_main.py`). |
+| [`flix_fast_common.py`](./flix_fast_common.py) | Shared, dependency-light helpers (no `torch`/`ctranslate2` import): model-dir validation, manifest/provenance reading, cache-path resolution, WAV validation, atomic JSON writing. Used by both scripts below so their idempotency/cache logic can never disagree. |
+| [`flix_fast_convert.py`](./flix_fast_convert.py) | CLI: converts an original pinned HF Whisper checkpoint directory to a quantized CTranslate2 model directory, writes `preprocessor_config.json` + `flix-fast-provenance.json`. Idempotent (skips re-conversion when a matching provenance record already exists). |
+| [`flix_fast_worker.py`](./flix_fast_worker.py) | CLI-compatible worker: same `--model`/`--input`/`--output`/`--threads`/`--serve` contract and JSON output schema as `main.py --engine whisper`, backed by `faster-whisper`. Requires a pre-converted CTranslate2 directory (does **not** auto-convert, to avoid silently loading the full model into RAM on worker startup). |
+| [`flix_fast_requirements.txt`](./flix_fast_requirements.txt) | Pinned deps for an isolated environment under the selected installation root (not part of the default ASR extras). |
+| [`tests/test_flix_fast_common.py`](./tests/test_flix_fast_common.py), [`tests/test_flix_fast_convert.py`](./tests/test_flix_fast_convert.py), [`tests/test_flix_fast_worker.py`](./tests/test_flix_fast_worker.py) | Pure-Python unit tests (no `torch`/`ctranslate2`/`faster_whisper` required to run them — heavy calls are injected via factory parameters, same pattern as `tests/test_main.py`). |
 
 ## Setup
 
+This experiment is **not** installed by the normal onboarding wizard.
+Use the `flix_fast_requirements.txt` shipped with the installed adapter
+runtime. Set `ASR_DIR` to the parent of the installed `[asr.flix].script`
+path in `config.toml`; do not install packages in the source checkout.
+
 ```bash
-cd adapters/asr
-uv venv --python 3.11 .venv-flix-fast
-uv pip install --python .venv-flix-fast/bin/python \
-    -r flix_fast_requirements.txt \
+SHUM_ROOT=/absolute/path/to/selected/installation
+ASR_DIR=/absolute/path/to/installed/runtime/adapters/asr
+SHUM_MODELS=/absolute/path/to/selected/models
+FLIX_REVISION=your-pinned-model-revision
+uv venv --python 3.11 "$SHUM_ROOT/runtime/environments/flix-fast"
+uv pip install --python "$SHUM_ROOT/runtime/environments/flix-fast/bin/python" \
+    -r "$ASR_DIR/flix_fast_requirements.txt" \
     --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
@@ -79,8 +214,8 @@ shapes; no model weights were loaded.
 ## Conversion
 
 ```bash
-.venv-flix-fast/bin/python flix_fast_convert.py \
-    --model /absolute/models/flix/<pinned-revision> \
+"$SHUM_ROOT/runtime/environments/flix-fast/bin/python" "$ASR_DIR/flix_fast_convert.py" \
+    --model "$SHUM_MODELS/flix/$FLIX_REVISION" \
     --quantization int8
 ```
 
@@ -116,8 +251,8 @@ loudly instead of silently transcribing with the wrong weights/vocabulary.
 ## Serving
 
 ```bash
-.venv-flix-fast/bin/python flix_fast_worker.py \
-    --model /absolute/models/flix/<pinned-revision> \
+"$SHUM_ROOT/runtime/environments/flix-fast/bin/python" "$ASR_DIR/flix_fast_worker.py" \
+    --model "$SHUM_MODELS/flix/$FLIX_REVISION" \
     --threads N --serve
 ```
 

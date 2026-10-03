@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +72,108 @@ def configure_thread_environment(threads: int) -> None:
     """Pin CPU thread counts before numpy/torch/ctranslate2 are imported."""
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(threads)
+
+
+def cgroup_headroom_bytes(
+    root: Path = Path("/sys/fs/cgroup"), *, membership: str | None = None,
+) -> int | None:
+    try:
+        if membership is None:
+            membership = Path("/proc/self/cgroup").read_text(encoding="ascii")
+        relative = next((line[3:] for line in membership.splitlines() if line.startswith("0::")), None)
+        if relative is None:
+            raise AdapterError("Cannot establish cgroup v2 membership")
+        directories = [root]
+        current = root
+        for part in relative.split("/"):
+            if not part:
+                continue
+            if part in (".", ".."):
+                raise AdapterError("Invalid cgroup membership path")
+            current = current / part
+            directories.append(current)
+        headroom = None
+        for directory in directories:
+            limit_path = directory / "memory.max"
+            if directory == root and not limit_path.exists():
+                continue
+            limit = limit_path.read_text(encoding="ascii").strip()
+            if limit == "max":
+                continue
+            maximum = int(limit)
+            used = int((directory / "memory.current").read_text(encoding="ascii").strip())
+            if maximum < 0 or used < 0:
+                raise AdapterError("Invalid negative cgroup memory limit/usage")
+            available = max(0, maximum - used)
+            headroom = available if headroom is None else min(headroom, available)
+        return headroom
+    except (OSError, ValueError) as exc:
+        raise AdapterError(f"Cannot establish cgroup memory headroom: {exc}") from exc
+
+
+def memory_full_avg10(text: str) -> float:
+    try:
+        fields = dict(field.split("=", 1) for line in text.splitlines()
+                      if line.startswith("full ") for field in line.split()[1:])
+        value = float(fields["avg10"])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("invalid full avg10")
+        return value
+    except (KeyError, ValueError) as exc:
+        raise AdapterError(f"Cannot parse memory PSI full avg10: {exc}") from exc
+
+
+def process_tree_memory_kib(pid: int, *, root: Path = Path("/proc")) -> tuple[int, int]:
+    """Return RSS and VmSwap for a worker and all live descendants."""
+    pending = [pid]
+    seen: set[int] = set()
+    rss = swap = 0
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        base = root / str(current)
+        try:
+            children = (base / "task" / str(current) / "children").read_text(encoding="ascii")
+        except FileNotFoundError:
+            if not base.exists():
+                continue
+            raise AdapterError(f"Cannot list worker {current} descendants")
+        except OSError as exc:
+            raise AdapterError(f"Cannot list worker {current} descendants: {exc}") from exc
+        try:
+            pending.extend(int(child) for child in children.split())
+        except ValueError as exc:
+            raise AdapterError(f"Invalid descendant PID for worker {current}") from exc
+        for attempt in range(4):
+            try:
+                status = (base / "status").read_text(encoding="ascii")
+            except FileNotFoundError:
+                if not base.exists():
+                    break
+                raise AdapterError(f"Cannot read worker {current} status")
+            except OSError as exc:
+                raise AdapterError(f"Cannot read worker {current} status: {exc}") from exc
+            fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+            if fields.get("State", "").strip().startswith(("Z", "X")):
+                break
+            if "VmRSS" not in fields or "VmSwap" not in fields:
+                if attempt < 3:
+                    time.sleep(0.01)
+                    continue
+                raise AdapterError(f"Invalid VmRSS/VmSwap for worker {current}")
+            try:
+                process_rss = int(fields["VmRSS"].split()[0])
+                process_swap = int(fields["VmSwap"].split()[0])
+                if process_rss < 0 or process_swap < 0:
+                    raise ValueError("negative process memory")
+                rss += process_rss
+                swap += process_swap
+                break
+            except (ValueError, IndexError) as exc:
+                raise AdapterError(f"Invalid VmRSS/VmSwap for worker {current}") from exc
+    return rss, swap
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,63 @@ import pytest
 import flix_fast_common as common
 
 
+def test_cgroup_headroom_includes_root_and_all_ancestors(tmp_path):
+    root = tmp_path / "cgroup"
+    child = root / "user"
+    leaf = child / "app"
+    leaf.mkdir(parents=True)
+    for directory, maximum, current in ((root, "1000", "100"), (child, "800", "600"), (leaf, "max", "50")):
+        (directory / "memory.max").write_text(maximum)
+        (directory / "memory.current").write_text(current)
+    assert common.cgroup_headroom_bytes(root, membership="0::/user/app") == 200
+    assert common.cgroup_headroom_bytes(root, membership="0::/") == 900
+
+
+def test_cgroup_headroom_rejects_unknown_or_invalid_membership(tmp_path):
+    with pytest.raises(common.AdapterError, match="membership"):
+        common.cgroup_headroom_bytes(tmp_path, membership="1:memory:/")
+    with pytest.raises(common.AdapterError, match="Invalid"):
+        common.cgroup_headroom_bytes(tmp_path, membership="0::/../")
+
+
+def test_unlimited_root_is_not_reported_as_zero_memory(tmp_path):
+    assert common.cgroup_headroom_bytes(tmp_path, membership="0::/") is None
+
+
+def test_process_memory_retries_transient_exec_status_without_zero_fallback(tmp_path, monkeypatch):
+    process = tmp_path / "123"
+    (process / "task" / "123").mkdir(parents=True)
+    (process / "task" / "123" / "children").write_text("")
+    (process / "status").write_text("State: R\n")
+
+    def complete_exec(_):
+        (process / "status").write_text("State: R\nVmRSS: 512 kB\nVmSwap: 0 kB\n")
+
+    monkeypatch.setattr(common.time, "sleep", complete_exec)
+    assert common.process_tree_memory_kib(123, root=tmp_path) == (512, 0)
+
+
+def test_psi_full_avg10_parser_is_strict():
+    assert common.memory_full_avg10("some avg10=9.0\nfull avg10=0.99 avg60=0.00 total=42") == 0.99
+    assert common.memory_full_avg10("full avg10=1.00 total=42") == 1.0
+    for malformed in ("some avg10=1.0", "full avg60=1.0", "full avg10=nan", "full avg10=-1"):
+        with pytest.raises(common.AdapterError, match="PSI"):
+            common.memory_full_avg10(malformed)
+
+
+def test_process_tree_swap_includes_descendants_and_errors_are_not_ignored(tmp_path):
+    for pid, children, rss, swap in ((1, "2", 100, 0), (2, "3", 200, 4), (3, "", 300, 5)):
+        base = tmp_path / str(pid)
+        (base / "task" / str(pid)).mkdir(parents=True)
+        (base / "task" / str(pid) / "children").write_text(children)
+        (base / "status").write_text(f"VmRSS:\t{rss} kB\nVmSwap:\t{swap} kB\n")
+    assert common.process_tree_memory_kib(1, root=tmp_path) == (600, 9)
+    (tmp_path / "3" / "status").write_text("VmRSS:\t300 kB\n")
+    with pytest.raises(common.AdapterError, match="VmRSS/VmSwap"):
+        common.process_tree_memory_kib(1, root=tmp_path)
+    assert common.process_tree_memory_kib(999, root=tmp_path) == (0, 0)
+
+
 def make_whisper_checkpoint_dir(tmp_path: Path, *, name: str = "model", nested_processor: bool = True) -> Path:
     model_dir = tmp_path / name
     model_dir.mkdir()

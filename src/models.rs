@@ -1,7 +1,7 @@
 //! Model provisioning and integrity checking for `shum`.
 //!
-//! A [`ModelSpec`] pins a role (e.g. "primeline", "flix", "qwen",
-//! "diarization") to a Hugging Face `repo` + `revision` (a commit sha) and a
+//! A [`ModelSpec`] pins a configured ASR role or "diarization"
+//! to a Hugging Face `repo` + `revision` (a commit sha) and a
 //! local `path` where the snapshot is materialized on disk. `revision` may
 //! be an empty string for a model that has not yet been installed.
 //!
@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -74,8 +74,7 @@ const HF_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// revision, and where it lives on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSpec {
-    /// Logical role this model fills in the pipeline: "primeline", "flix",
-    /// "qwen", or "diarization".
+    /// Configured ASR role or "diarization".
     pub role: String,
     /// Hugging Face repo id, e.g. "primeline/whisper-large-v3-german".
     pub repo: String,
@@ -165,24 +164,7 @@ fn check_one_with<F>(spec: &ModelSpec, fetch_remote_revision: F) -> anyhow::Resu
 where
     F: FnOnce(&str) -> anyhow::Result<String>,
 {
-    if spec.revision.is_empty() {
-        bail!(
-            "model role '{}' ({}) has no pinned revision yet — run `shum models update --role {}` to bootstrap it",
-            spec.role,
-            spec.repo,
-            spec.role
-        );
-    }
-
-    let manifest = load_manifest(&spec.path).with_context(|| {
-        format!(
-            "local model for role '{}' ({}) is missing at {} — run `shum models update --role {}` first",
-            spec.role,
-            spec.repo,
-            spec.path.display(),
-            spec.role
-        )
-    })?;
+    let manifest = required_manifest(spec)?;
 
     let integrity_ok = manifest.repo == spec.repo
         && manifest.revision == spec.revision
@@ -204,6 +186,45 @@ where
         integrity_ok,
         availability,
     })
+}
+
+fn required_manifest(spec: &ModelSpec) -> anyhow::Result<Manifest> {
+    if spec.revision.is_empty() {
+        bail!(
+            "model role '{}' ({}) has no pinned revision yet — run `shum models update --role {}` to bootstrap it",
+            spec.role,
+            spec.repo,
+            spec.role
+        );
+    }
+
+    load_manifest(&spec.path).with_context(|| {
+        format!(
+            "local model for role '{}' ({}) is missing at {} — run `shum models update --role {}` first",
+            spec.role,
+            spec.repo,
+            spec.path.display(),
+            spec.role
+        )
+    })
+}
+
+pub fn verify_local(spec: &ModelSpec) -> anyhow::Result<()> {
+    let manifest = required_manifest(spec)?;
+    ensure!(
+        manifest.repo == spec.repo && manifest.revision == spec.revision,
+        "model {} has a different repository or revision at {}; reinstall the pinned model",
+        spec.role,
+        spec.path.display()
+    );
+    let current = compute_dir_hashes(&spec.path)?;
+    ensure!(
+        current == manifest.files,
+        "model {} failed local checksum verification at {}; reinstall the pinned model",
+        spec.role,
+        spec.path.display()
+    );
+    Ok(())
 }
 
 /// Query the Hugging Face model API for the current default-branch revision
@@ -980,6 +1001,25 @@ mod tests {
     }
 
     #[test]
+    fn different_custom_roles_can_pin_independent_snapshots_from_one_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        for role in ["interview", "meeting"] {
+            let target = dir.path().join(role);
+            let model = spec(role, "example/shared", "pinned-sha", &target);
+            let installed = install_pinned_with(&model, |repo, revision, staging| {
+                assert_eq!(repo, "example/shared");
+                assert_eq!(revision, "pinned-sha");
+                fs::write(staging.join("weights.bin"), role)?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(installed.role, role);
+            assert_eq!(installed.path, target.join("pinned-sha"));
+            verify_local(&installed).unwrap();
+        }
+    }
+
+    #[test]
     fn install_pinned_errors_on_empty_revision() {
         let s = spec("primeline", "org/repo", "", Path::new("/models/primeline"));
         let err = install_pinned(&s).unwrap_err();
@@ -1096,5 +1136,27 @@ mod tests {
         let status = check_one_with(&s, |_repo| Ok("new-sha".to_string())).unwrap();
         assert!(!status.integrity_ok);
         assert_eq!(status.availability, Availability::UpToDate);
+    }
+
+    #[test]
+    fn local_execution_verification_rejects_corruption_without_network() {
+        let dir = TempDir::new("local-verify");
+        fs::write(dir.path().join("weights.bin"), b"weights").unwrap();
+        save_manifest(
+            dir.path(),
+            &Manifest {
+                repo: "org/repo".to_owned(),
+                revision: "pinned-sha".to_owned(),
+                files: compute_dir_hashes(dir.path()).unwrap(),
+            },
+        )
+        .unwrap();
+        let mut model = spec("flix", "org/repo", "pinned-sha", dir.path());
+        verify_local(&model).unwrap();
+        model.revision = "different-sha".to_owned();
+        assert!(verify_local(&model).is_err());
+        model.revision = "pinned-sha".to_owned();
+        fs::write(dir.path().join("weights.bin"), b"changed").unwrap();
+        assert!(verify_local(&model).is_err());
     }
 }

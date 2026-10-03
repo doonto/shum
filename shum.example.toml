@@ -4,6 +4,23 @@
 # Optional: review_rules = "rules.txt" (domain vocabulary/style for the LLM;
 # cannot override the rule against inventing words).
 
+# Advisory diagnostics do not change text or start ASR retries/LLM calls.
+# Additional audio/text thresholds are optional; defaults are preliminary,
+# not calibrated measures of transcription accuracy.
+[quality]
+enabled = true
+max_chunks = 10000
+inspect_source_channels = true
+
+[quality.audio]
+max_scan_seconds = 1800.0
+max_sample_frames = 120000000
+max_decode_seconds = 60
+# Amplitudes are fractions of PCM full scale; dBFS uses 0 dB as full scale.
+near_zero_threshold = 0.001
+full_scale_threshold = 0.999
+low_rms_dbfs = -50.0
+
 [[models]]
 role = "primeline"
 repo = "primeline/parakeet-primeline"
@@ -29,6 +46,7 @@ revision = ""
 path = "models/diarization"
 
 [asr.primeline]
+# Legacy roles infer their engine when this field is absent.
 program = "adapters/asr/.venv-nemo/bin/python"
 script = "adapters/asr/main.py"
 threads = 6
@@ -46,6 +64,37 @@ threads = 6
 # *original* Qwen model revision, pinned GGUF hashes and required args.
 # max_in_flight = 4
 
+# To use only one model, remove the other ASR [[models]] and [asr.ID] entries,
+# leaving exactly one diarization model and an estimate for the active ID.
+# Add another ASR by adding BOTH an [asr.ID] adapter and exactly one [[models]]
+# record with role = "ID". Custom roles require engine = "nemo", "whisper"
+# or "qwen". Any positive number of ASR IDs is supported.
+# The weights must match the chosen adapter/engine; arbitrary model types
+# cannot be loaded by main.py. Removing both entries disables a role.
+# Keep the actual configured models and private config outside the source tree.
+# [[models]]
+# role = "meeting_whisper"
+# repo = "your-org/compatible-whisper-checkpoint"
+# revision = ""
+# path = "models/meeting_whisper"
+# [asr.meeting_whisper]
+# engine = "whisper"
+# program = "adapters/asr/.venv-whisper/bin/python"
+# script = "adapters/asr/main.py"
+# threads = 6
+# A second ID can use the SAME engine and program with different compatible
+# Whisper weights. The ID, not the engine, identifies the model and its cache.
+# [[models]]
+# role = "interview_whisper"
+# repo = "your-org/second-compatible-whisper-checkpoint"
+# revision = ""
+# path = "models/interview_whisper"
+# [asr.interview_whisper]
+# engine = "whisper"
+# program = "adapters/asr/.venv-whisper/bin/python"
+# script = "adapters/asr/main.py"
+# threads = 6
+
 [diarization]
 program = "adapters/diarization/.venv/bin/python"
 script = "adapters/diarization/main.py"
@@ -56,8 +105,13 @@ threads = 4
 [resources]
 reserve_mib = 4096
 max_asr_workers = 3
+# Optional cap on simultaneously active distinct ASR IDs (not process count).
+# max_parallel_asr_models = 2
+# Serialize different ASR models while allowing each model's measured replicas.
+# Unlike --sequential-asr, this does not force one process per model.
+sequential_asr_roles = false
 oom_retries = 2
-# Optional: enable tested CPU/disk offload for Flix and Qwen only. Directory
+# Optional: enable CPU/disk offload for configured Whisper/Qwen main.py roles. Directory
 # must be private (0700) and outside original model snapshots.
 # offload_dir = "/absolute/shum-data/projects/.asr-offload"
 # When using a faster engine without Accelerate offload for Flix, set ["qwen"].
@@ -69,11 +123,17 @@ supervise_asr_with_systemd = false
 # Optional hard RAM limit per isolated worker; requires systemd supervision.
 # A limit below the model's loading/generation peak can cause repeated OOM.
 # systemd_memory_limit_mib = 16000
+# Optional per-worker swap cap, including zero; requires systemd supervision.
+# systemd_swap_limit_mib = 0
 
 [resources.estimated_peak_mib]
 primeline = 6000
 flix = 10500
 qwen = 13500
+# Required for each additional [asr.ID] (measure on your machine):
+# meeting_whisper = 10500
+# interview_whisper = 10500
+# Estimates for inactive or removed historical IDs may remain here.
 
 [resources.offload_estimated_peak_mib]
 flix = 6500
@@ -87,9 +147,15 @@ qwen = 7000
 # [resources.asr_worker_peak_mib]
 # flix = 2600
 
-# Codex reads a prompt from stdin and writes the last response to {output}.
-# Replace with another CLI and arguments if desired; its response must match
-# the structured JSON contract described in README.md.
+# Onboarding enables review only after choosing a provider, or saves it as
+# unavailable when the user explicitly chooses to configure access later.
+# Providers: codex, copilot, custom. Authentication stays in the provider CLI.
+# Custom args accept {output}/{model}; probe_args must return SHUM_READY
+# for the fixed technical prompt on stdin, without project data.
 [llm]
+enabled = false
+provider = "codex"
 program = "codex"
-args = ["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "{output}", "-"]
+args = []
+# model = "your-provider-model"
+# probe_args = ["your-probe-subcommand"]

@@ -210,6 +210,37 @@ def configure_thread_environment(threads: int) -> None:
 PipelineFactory = Callable[[str, int], Any]
 
 
+def emit_profile(phase: str, status: str, **fields: Any) -> None:
+    print(
+        json.dumps(
+            {"event": "shum.profile", "version": 1, "phase": phase,
+             "status": status, **fields},
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+@contextlib.contextmanager
+def measured_phase(phase: str, enabled: bool):
+    if not enabled:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    except BaseException:
+        emit_profile(
+            phase, "failed", elapsed_seconds=time.perf_counter() - started,
+        )
+        raise
+    else:
+        emit_profile(
+            phase, "completed", elapsed_seconds=time.perf_counter() - started,
+        )
+
+
 def default_pipeline_factory(model_dir: str, threads: int) -> Any:
     try:
         import torch
@@ -276,17 +307,50 @@ def configure_batch_sizes(pipeline: Any, segmentation: int, embedding: int) -> N
             setattr(pipeline, name, size)
 
 
-def run_profiled_pipeline(pipeline: Any, audio_input: Any, **options: Any) -> Any:
+def run_profiled_pipeline(
+    pipeline: Any, audio_input: Any, *, profile: bool = True, **options: Any
+) -> Any:
     started = time.perf_counter()
     previous = started
     progress: dict[str, int] = {}
+    measurements: dict[str, tuple[int, int]] = {}
+    boundary = started
+    boundary_name = "pipeline_start"
+    active_phase: str | None = None
+    clustering_started: float | None = None
 
     def hook(step: str, _artifact: Any, **kwargs: Any) -> None:
-        nonlocal previous
+        nonlocal previous, boundary, boundary_name, active_phase, clustering_started
         if kwargs.get("total") is not None:
             total = kwargs["total"]
             completed = kwargs.get("completed", 0)
-            if total > 0:
+            if (
+                step in ("segmentation", "embeddings")
+                and isinstance(total, int)
+                and isinstance(completed, int)
+                and total > 0
+                and 0 <= completed <= total
+                and measurements.get(step) != (completed, total)
+            ):
+                measurements[step] = (completed, total)
+                if profile:
+                    active_phase = step
+                    emit_profile(step, "progress", completed=completed, total=total)
+                print(
+                    json.dumps(
+                        {
+                            "event": "shum.progress",
+                            "version": 1,
+                            "phase": step,
+                            "completed": completed,
+                            "total": total,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if profile and total > 0:
                 tenths = min(10, completed * 10 // total)
                 if tenths > progress.get(step, 0) and tenths < 10:
                     progress[step] = tenths
@@ -296,15 +360,53 @@ def run_profiled_pipeline(pipeline: Any, audio_input: Any, **options: Any) -> An
                         file=sys.stderr,
                     )
             return
+        if not profile:
+            return
         now = time.perf_counter()
         print(f"diarization {step}: {now - previous:.2f}s", file=sys.stderr)
         previous = now
+        if step in ("segmentation", "embeddings"):
+            emit_profile(
+                step, "completed", elapsed_seconds=now - boundary,
+                since=boundary_name,
+                **({"completed": measurements[step][0], "total": measurements[step][1]}
+                   if step in measurements else {}),
+            )
+            active_phase = None
+            if step == "embeddings":
+                clustering_started = now
+                active_phase = "clustering_assembly"
+        boundary = now
+        boundary_name = step
 
     try:
         result = pipeline(audio_input, hook=hook, **options)
     except Exception as exc:
+        if profile:
+            now = time.perf_counter()
+            if active_phase is not None:
+                emit_profile(
+                    active_phase, "failed",
+                    elapsed_seconds=now - (
+                        clustering_started if active_phase == "clustering_assembly"
+                        and clustering_started is not None else boundary
+                    ),
+                    since="embeddings" if active_phase == "clustering_assembly" else boundary_name,
+                    **({"completed": measurements[active_phase][0],
+                        "total": measurements[active_phase][1]}
+                       if active_phase in measurements else {}),
+                )
+            emit_profile("pipeline_total", "failed", elapsed_seconds=now - started)
         raise AdapterError(f"Diarization failed: {exc}") from exc
-    print(f"diarization total: {time.perf_counter() - started:.2f}s", file=sys.stderr)
+    if profile:
+        now = time.perf_counter()
+        if clustering_started is not None:
+            emit_profile(
+                "clustering_assembly", "completed",
+                elapsed_seconds=now - clustering_started, since="embeddings",
+            )
+        emit_profile("pipeline_total", "completed", elapsed_seconds=now - started)
+        print(f"diarization total: {now - started:.2f}s", file=sys.stderr)
     return result
 
 
@@ -384,25 +486,46 @@ def run(argv: Sequence[str] | None = None, pipeline_factory: PipelineFactory | N
         configure_thread_environment(threads)
 
         factory = pipeline_factory or default_pipeline_factory
-        pipeline = factory(str(model_path), threads)
-        configure_batch_sizes(
-            pipeline, args.segmentation_batch_size, args.embedding_batch_size,
-        )
+        parameters = {
+            "threads": threads,
+            "requested_segmentation_batch_size": args.segmentation_batch_size,
+            "requested_embedding_batch_size": args.embedding_batch_size,
+            "preload_audio": args.preload_audio,
+        }
+        if args.profile:
+            emit_profile("parameters", "requested", parameters=parameters)
+        with measured_phase("model_loading", args.profile):
+            pipeline = factory(str(model_path), threads)
+        with measured_phase("batch_configuration", args.profile):
+            configure_batch_sizes(
+                pipeline, args.segmentation_batch_size, args.embedding_batch_size,
+            )
+        if args.profile:
+            emit_profile(
+                "parameters", "configured",
+                parameters={
+                    **parameters,
+                    "segmentation_batch_size": getattr(pipeline, "segmentation_batch_size", None),
+                    "embedding_batch_size": getattr(pipeline, "embedding_batch_size", None),
+                },
+            )
         audio_input: Any = str(input_path)
         if args.preload_audio:
             loading_started = time.perf_counter()
-            audio_input = load_waveform(str(input_path))
+            with measured_phase("waveform_loading", args.profile):
+                audio_input = load_waveform(str(input_path))
             if args.profile:
                 print(
                     f"diarization waveform load: {time.perf_counter() - loading_started:.2f}s",
                     file=sys.stderr,
                 )
-        diarization_output = (
-            run_profiled_pipeline(pipeline, audio_input)
-            if args.profile else run_pipeline(pipeline, audio_input)
+        diarization_output = run_profiled_pipeline(
+            pipeline, audio_input, profile=args.profile
         )
-        result = diarization_output_to_result(diarization_output)
-        write_result(result, output_path)
+        with measured_phase("result_conversion", args.profile):
+            result = diarization_output_to_result(diarization_output)
+        with measured_phase("result_writing", args.profile):
+            write_result(result, output_path)
     except AdapterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
